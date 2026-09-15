@@ -211,6 +211,56 @@ func TestNormalizeDedupesForwardHeaders(t *testing.T) {
 	}
 }
 
+// probe_headers 的键要小写化、空值要剔除——探测缺了身份头会得出错误结论。
+func TestNormalizeProbeHeaders(t *testing.T) {
+	cfg := Default()
+	cfg.ProbeHeaders = map[string]string{
+		"X-Client-Type": "  cline-cli  ",
+		"":              "nope",
+		"x-empty":       "   ",
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if len(cfg.ProbeHeaders) != 1 {
+		t.Fatalf("ProbeHeaders = %v, want only x-client-type", cfg.ProbeHeaders)
+	}
+	if v := cfg.ProbeHeaders["x-client-type"]; v != "cline-cli" {
+		t.Errorf("value = %q, want trimmed cline-cli", v)
+	}
+}
+
+func TestDefaultShipsProbeHeaders(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	// 默认必须带上，否则 probe 对 deepseek/... 这类模型会 403 而误判。
+	if cfg.ProbeHeaders["x-client-type"] != "cline-cli" {
+		t.Errorf("default probe headers = %v", cfg.ProbeHeaders)
+	}
+}
+
+func TestEnvProbeHeaders(t *testing.T) {
+	t.Setenv("CLINE_PIN_PROBE_HEADERS", "x-client-type: cline-cli, x-app: demo")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProbeHeaders["x-client-type"] != "cline-cli" || cfg.ProbeHeaders["x-app"] != "demo" {
+		t.Errorf("ProbeHeaders = %v", cfg.ProbeHeaders)
+	}
+	// 没有冒号的条目要忽略，避免把写错的配置当合法头名。
+	t.Setenv("CLINE_PIN_PROBE_HEADERS", "broken-without-colon, x-ok: 1")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ProbeHeaders) != 1 || cfg.ProbeHeaders["x-ok"] != "1" {
+		t.Errorf("ProbeHeaders = %v, want only x-ok", cfg.ProbeHeaders)
+	}
+}
+
 func TestLoadFromFileOverridesOnlyGivenFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

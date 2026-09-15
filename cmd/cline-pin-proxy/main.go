@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -86,6 +87,7 @@ func usage() {
 示例:
   cline-pin-proxy serve -config config.json
   cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
+  cline-pin-proxy probe -model deepseek/deepseek-v4-flash -H "x-client-type: cline-cli"
   cline-pin-proxy check -config config.json -model deepseek-v4-flash
   cline-pin-proxy healthcheck -url http://127.0.0.1:8787/healthz
 
@@ -94,6 +96,7 @@ func usage() {
   CLINE_PIN_UPSTREAM           Cline Pass 基址
   CLINE_PIN_API_KEY            固定上游 API Key（为空则透传客户端凭据）
   CLINE_PIN_FORWARD_HEADERS    额外透传的请求头，逗号分隔
+  CLINE_PIN_PROBE_HEADERS      probe 附带的请求头，"name: value" 逗号分隔
   CLINE_PIN_MAX_BODY_BYTES     请求体上限
   CLINE_PIN_RULES              规则表 JSON，覆盖配置文件
   CLINE_PIN_LOG_LEVEL          日志级别 debug|info|warn|error
@@ -171,6 +174,9 @@ func runProbe(args []string) error {
 	model := fs.String("model", "", "要探测的模型 ID，例如 cline-pass/deepseek-v4.1-flash")
 	pipeline := fs.String("pipeline", "auto", "强制管道：auto|planner|direct")
 	apiKey := fs.String("api-key", "", "覆盖 API Key")
+	var headerFlags multiFlag
+	fs.Var(&headerFlags, "H", `附加上游请求头，格式 "name: value"，可重复。`+
+		`部分模型（如 deepseek/... 规范名）缺少 x-client-type 会 403`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -188,6 +194,18 @@ func runProbe(args []string) error {
 	if cfg.APIKey == "" {
 		return errors.New("probe: 缺少 API Key，请设置 CLINE_PIN_API_KEY 或传 -api-key")
 	}
+	if len(headerFlags) > 0 {
+		if cfg.ProbeHeaders == nil {
+			cfg.ProbeHeaders = map[string]string{}
+		}
+		for _, item := range headerFlags {
+			name, value, ok := strings.Cut(item, ":")
+			if !ok {
+				return fmt.Errorf("probe: -H 需要 \"name: value\" 格式，收到 %q", item)
+			}
+			cfg.ProbeHeaders[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+		}
+	}
 
 	client := &http.Client{Timeout: 90 * time.Second}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -200,6 +218,14 @@ func runProbe(args []string) error {
 
 	fmt.Printf("模型      : %s\n", res.Model)
 	fmt.Printf("上游状态码: %d\n", res.Status)
+	if len(cfg.ProbeHeaders) > 0 {
+		names := make([]string, 0, len(cfg.ProbeHeaders))
+		for k := range cfg.ProbeHeaders {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		fmt.Printf("附带请求头: %s\n", strings.Join(names, ", "))
+	}
 	if res.Pipeline == "" {
 		fmt.Printf("管道      : 未识别（网关措辞可能已变化）\n")
 	} else {
@@ -210,6 +236,8 @@ func runProbe(args []string) error {
 		if res.Detail != "" {
 			fmt.Printf("原始片段  : %s\n", res.Detail)
 		}
+		fmt.Printf("\n提示：若上游返回 4xx 而非路由层报错，可能是缺少调用方身份头；\n" +
+			"      试加 -H \"x-client-type: cline-cli\" 或配置 probe_headers。\n")
 		return nil
 	}
 
@@ -217,6 +245,9 @@ func runProbe(args []string) error {
 	for i, u := range res.Upstreams {
 		fmt.Printf("  %2d. %s\n", i+1, u)
 	}
+	fmt.Printf("\n注意：该清单来自路由层的错误信息，**不保证穷尽**——实测有好用的上游\n" +
+		"      并不出现在这份清单里。要确认某个 slug 是否真的可用，直接发一次\n" +
+		"      钉住它的真实请求、再看响应里的 finalProvider / provider 字段。\n")
 
 	rule := config.Rule{
 		Name:      "pin-" + sanitizeName(res.Model),
@@ -279,6 +310,16 @@ func runCheck(args []string) error {
 			fmt.Printf("\n模型 %q 未命中任何规则 → 将纯净透传，由 Cline Pass 自主路由\n", m)
 		}
 	}
+	return nil
+}
+
+// multiFlag 允许同一个 flag 重复出现并累积取值。
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
 	return nil
 }
 

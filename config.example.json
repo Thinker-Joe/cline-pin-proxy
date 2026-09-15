@@ -3,6 +3,9 @@
   "upstream": "https://api.cline.bot/api/v1",
   "api_key": "",
   "forward_headers": ["x-client-type"],
+  "probe_headers": {
+    "x-client-type": "cline-cli"
+  },
   "max_body_bytes": 67108864,
   "rules": [
     {

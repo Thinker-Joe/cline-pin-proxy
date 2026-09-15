@@ -157,6 +157,7 @@ cp config.example.json config.json
   "upstream": "https://api.cline.bot/api/v1",
   "api_key": "",
   "forward_headers": ["x-client-type"],
+  "probe_headers": { "x-client-type": "cline-cli" },
   "max_body_bytes": 67108864,
   "rules": [
     {
@@ -201,6 +202,7 @@ cp config.example.json config.json
 | `CLINE_PIN_UPSTREAM` | Cline Pass 基址，默认 `https://api.cline.bot/api/v1` |
 | `CLINE_PIN_API_KEY` | 固定上游密钥；留空则透传调用方的 `Authorization` |
 | `CLINE_PIN_FORWARD_HEADERS` | 额外透传的请求头，逗号分隔 |
+| `CLINE_PIN_PROBE_HEADERS` | `probe` 附带的请求头，`name: value` 逗号分隔 |
 | `CLINE_PIN_MAX_BODY_BYTES` | 请求体上限，默认 64 MiB |
 | `CLINE_PIN_RULES` | 规则表 JSON，整体覆盖配置文件 |
 | `CLINE_PIN_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
@@ -236,6 +238,20 @@ cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
 而错误信息里会带上它当前可用的完整渠道清单。
 
 两条管道的错误格式不同，代理会分别解析；`-pipeline` 可强制指定以排查管道归属。
+
+### 两个必须知道的局限
+
+**① 清单不保证穷尽。** 实测 `deepseek/deepseek-v4-flash` 的清单列了 26 个上游、
+**不含 `deepseek`**，但钉到 `deepseek` 却成功。要确认某个 slug 真的可用，
+必须发一次钉住它的真实请求，再读响应里的 `finalProvider` / `provider`。
+
+**② 部分模型要求调用方身份头。** `deepseek/...` 这类规范名缺少
+`x-client-type: cline-cli` 会直接 403 —— 这会让探测得出与线上相反的结论。
+`probe` 默认已带上该头（可用 `probe_headers` 配置或 `-H` 覆盖）：
+
+```bash
+cline-pin-proxy probe -model deepseek/deepseek-v4-flash -H "x-client-type: cline-cli"
+```
 
 ### 校验配置
 

@@ -80,6 +80,12 @@ type Config struct {
 	APIKey string `json:"api_key"`
 	// ForwardHeaders 是额外需要透传给上游的客户端请求头（大小写不敏感）。
 	ForwardHeaders []string `json:"forward_headers"`
+	// ProbeHeaders 是 `probe` 子命令要附带的请求头及其取值。
+	//
+	// 必须单独配置取值，因为探测时没有"客户端请求"可供转发。实测：
+	// `deepseek/deepseek-v4-flash` 这类模型缺少 `x-client-type: cline-cli`
+	// 会直接 403，导致探测结论与线上真实行为不一致。
+	ProbeHeaders map[string]string `json:"probe_headers"`
 	// MaxBodyBytes 是允许读取的最大请求体字节数。
 	MaxBodyBytes int64 `json:"max_body_bytes"`
 	// Rules 是钉死规则表。
@@ -113,6 +119,9 @@ func Default() *Config {
 		MaxBodyBytes: DefaultMaxBodyBytes,
 		// Cline 网关会用这个头区分调用方，上游侧常见配置依赖它，因此默认透传。
 		ForwardHeaders: []string{"x-client-type"},
+		// 探测时也要带上同一个头，否则部分模型（如 deepseek/... 规范名）
+		// 会 403，得出与线上相反的结论。
+		ProbeHeaders: map[string]string{"x-client-type": "cline-cli"},
 		Rules: []Rule{
 			{
 				Name:      "deepseek",
@@ -186,6 +195,9 @@ func applyEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_FORWARD_HEADERS")); v != "" {
 		cfg.ForwardHeaders = splitList(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_PROBE_HEADERS")); v != "" {
+		cfg.ProbeHeaders = parseHeaderPairs(v)
+	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_RULES")); v != "" {
 		var rules []Rule
 		if err := json.Unmarshal([]byte(v), &rules); err == nil {
@@ -201,6 +213,25 @@ func splitList(s string) []string {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// parseHeaderPairs 解析 "name: value, name2: value2" 形式的请求头配置。
+// 找不到冒号的条目会被忽略，避免把写错的配置当成合法头名。
+func parseHeaderPairs(s string) map[string]string {
+	out := make(map[string]string)
+	for _, item := range splitList(s) {
+		name, value, ok := strings.Cut(item, ":")
+		if !ok {
+			continue
+		}
+		name = strings.ToLower(strings.TrimSpace(name))
+		value = strings.TrimSpace(value)
+		if name == "" || value == "" {
+			continue
+		}
+		out[name] = value
 	}
 	return out
 }
@@ -238,6 +269,17 @@ func (c *Config) Normalize() error {
 		headers = append(headers, lower)
 	}
 	c.ForwardHeaders = headers
+
+	probeHeaders := make(map[string]string, len(c.ProbeHeaders))
+	for name, value := range c.ProbeHeaders {
+		name = strings.ToLower(strings.TrimSpace(name))
+		value = strings.TrimSpace(value)
+		if name == "" || value == "" {
+			continue
+		}
+		probeHeaders[name] = value
+	}
+	c.ProbeHeaders = probeHeaders
 
 	for i := range c.Rules {
 		if err := c.Rules[i].Normalize(i); err != nil {

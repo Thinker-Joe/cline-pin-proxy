@@ -274,6 +274,38 @@ func TestProbeUpstreamUnreachable(t *testing.T) {
 	}
 }
 
+// 探测必须带上 probe_headers。
+//
+// 实测：`deepseek/deepseek-v4-flash` 缺少 `x-client-type: cline-cli` 会直接 403，
+// 此时探测会得出「不支持钉死」的错误结论，与线上真实行为相反。
+func TestProbeSendsConfiguredHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(realDirectResponse))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Upstream:     srv.URL,
+		ProbeHeaders: map[string]string{"x-client-type": "cline-cli", "x-extra": "1"},
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Probe(context.Background(), srv.Client(), cfg, "m", ""); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if v := got.Get("x-client-type"); v != "cline-cli" {
+		t.Errorf("x-client-type = %q, want cline-cli", v)
+	}
+	if v := got.Get("x-extra"); v != "1" {
+		t.Errorf("x-extra = %q, want 1", v)
+	}
+}
+
 func contains(list []string, want string) bool {
 	for _, item := range list {
 		if item == want {

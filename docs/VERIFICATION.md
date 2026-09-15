@@ -43,16 +43,55 @@ planner 生效，顶层 `provider.only` 只对 direct 生效。本项目默认�
 
 上游 slug 会随 Cline 侧渠道池变动，**上线前务必逐模型 `probe` 复核**。
 
-### 单渠道私有模型
+### 逐模型的钉死支持情况（DeepSeek 系，2026-09-16 判定）
 
-`deepseek-v4-flash`、`deepseek-v4-pro`、`kimi-k3` 这类模型**没有可枚举的多上游**：
+判定方法：注入 `only: ["__probe__"]`（一个绝不存在的上游）。
 
-- `probe` 无法枚举（`__probe__` 过滤被忽略，不产生路由错误）
-- 真实请求的 `finalProvider` 恒为 `openai-compatible-private`，`fallbacksAvailable` 为空
-- 对它们注入 `only` **会被忽略，既不生效也不报错**
+- 被路由层拦下并报出可用清单 ⇒ **过滤器生效，支持钉死**
+- 照常返回正文 ⇒ **过滤器被忽略，钉死无效**
 
-结论：这类模型**不需要钉死**。默认规则里保留 `deepseek` 一条对它们是前向兼容
-（将来若变为多上游即自动生效），但不要指望它当下改变路由。
+| 模型 | `__probe__` 结果 | 是否支持钉死 |
+|---|---|---|
+| `cline-pass/deepseek-v4.1-flash` | 500 + 路由层错误 | **✅ 支持** |
+| `deepseek/deepseek-v4-flash` | 500 + 路由层错误 | **✅ 支持** |
+| `cline-pass/deepseek-v4-flash` | 200 + 正文 `OK` | ❌ 不生效 |
+| `cline-pass/deepseek-v4-pro` | 200 + 正文 `OK` | ❌ 不生效 |
+| `cline-pass/deepseek-v4-flash-vision-exp` | 404 `model not found` | 模型不存在 |
+
+对**不支持**的两个模型，注入 `only` 会被静默忽略——既不生效也不报错，
+所以默认规则里保留 `deepseek` 一条是安全的（前向兼容），但不要指望它改变路由。
+
+**结论：DeepSeek 系里只有两个模型能真正钉死。** 其中
+`cline-pass/deepseek-v4-flash` 与 `-v4-pro` 走固定的私有渠道，无从选择。
+
+### ⚠️ `available_providers` 清单不保证穷尽
+
+实测：`deepseek/deepseek-v4-flash` 的路由错误列出了 26 个上游，**里面没有
+`deepseek`**；但把请求钉到 `deepseek` 却成功，且响应里 `provider: "DeepSeek"`。
+
+| 注入 | 响应里的 `provider` |
+|---|---|
+| 不钉 | `Relace` |
+| 钉 `deepseek` | **`DeepSeek`** |
+| 钉 `novita` | **`Novita`** |
+
+也就是说，**`probe` 给出的清单只是「路由层愿意披露的那部分」**。
+要确认某个 slug 是否真的可用，必须发一次钉住它的真实请求，再读响应里的
+`finalProvider`（planner）或 `provider`（direct）。
+
+### ⚠️ 部分模型要求调用方身份头
+
+`deepseek/deepseek-v4-flash` 缺少 `x-client-type: cline-cli` 会直接 403：
+
+```
+403 deepseek/deepseek-v4-flash is only available via Cline product surfaces.
+```
+
+这意味着**探测本身也必须带上这个头**，否则会得出与线上相反的结论。
+`probe` 已支持 `probe_headers` 配置与 `-H "name: value"` 覆盖，默认带上
+`x-client-type: cline-cli`。
+
+代理侧的 `forward_headers: ["x-client-type"]` 因此是承重配置，不是可选项。
 
 ### deepseek-4.1-flash 的真实可用上游（16）
 

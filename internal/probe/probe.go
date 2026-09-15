@@ -92,6 +92,12 @@ func Probe(ctx context.Context, client *http.Client, cfg *config.Config, model, 
 	if key := strings.TrimSpace(cfg.APIKey); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+	// 上游可能要求调用方身份头。实测 `deepseek/deepseek-v4-flash` 缺少
+	// `x-client-type: cline-cli` 会直接 403，此时探测会得出与线上相反的结论，
+	// 所以探测必须带上与代理转发同一套请求头。
+	for name, value := range cfg.ProbeHeaders {
+		req.Header.Set(name, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
