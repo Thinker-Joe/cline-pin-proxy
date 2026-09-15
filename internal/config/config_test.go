@@ -18,15 +18,59 @@ func TestDefaultIsValid(t *testing.T) {
 	if cfg.Upstream != DefaultUpstream {
 		t.Errorf("Upstream = %q, want %q", cfg.Upstream, DefaultUpstream)
 	}
-	if len(cfg.Rules) == 0 {
-		t.Fatal("default rules should cover deepseek and glm")
+	if len(cfg.Rules) != 3 {
+		t.Fatalf("default should ship 3 rules, got %d", len(cfg.Rules))
 	}
-	// 默认必须带上 DeepSeek 与 GLM 两条，这是本项目要解决的核心场景。
-	if _, ok := cfg.Match("cline-pass/deepseek-v4.1-flash"); !ok {
-		t.Error("default rules should match deepseek models")
+}
+
+// 默认规则必须把每个模型送到**实测确认过的**上游 slug。
+//
+// 这里锁死的是 2026-09-16 真实探测的结果：glm-5.3-flash 的上游叫 z-ai，
+// 而 glm-5.3 的上游叫 zai。早期版本用一条泛化的 `glm` → z-ai 规则，
+// 把 glm-5.3 打成了 400，所以顺序与 slug 都是承重的，不能随手动。
+func TestDefaultRulesRouteEveryModelToVerifiedSlug(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
 	}
-	if _, ok := cfg.Match("cline-pass/glm-5.3"); !ok {
-		t.Error("default rules should match glm models")
+
+	cases := []struct {
+		model string
+		rule  string
+		slug  string
+	}{
+		{"cline-pass/deepseek-v4.1-flash", "deepseek", "deepseek"},
+		{"cline-pass/deepseek-v4-flash", "deepseek", "deepseek"},
+		{"cline-pass/glm-5.3", "glm-5.3", "zai"},
+		{"cline-pass/glm-5.3-flash", "glm-5.3-flash", "z-ai"},
+		{"z-ai/glm-5.3-flash", "glm-5.3-flash", "z-ai"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			rule, ok := cfg.Match(tc.model)
+			if !ok {
+				t.Fatalf("%s matched no rule", tc.model)
+			}
+			if rule.Name != tc.rule {
+				t.Errorf("matched rule %q, want %q（具体规则必须排在泛化规则之前）", rule.Name, tc.rule)
+			}
+			if len(rule.Upstreams) != 1 || rule.Upstreams[0] != tc.slug {
+				t.Errorf("upstreams = %v, want [%s]", rule.Upstreams, tc.slug)
+			}
+		})
+	}
+}
+
+// 未纳入默认规则的模型必须保持不钉（透传），不能被泛化规则误伤。
+func TestDefaultRulesLeaveUnknownModelsAlone(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"cline-pass/kimi-k3", "cline-pass/qwen3.8-max", "gpt-5.4"} {
+		if rule, ok := cfg.Match(model); ok {
+			t.Errorf("%s unexpectedly matched rule %q", model, rule.Name)
+		}
 	}
 }
 

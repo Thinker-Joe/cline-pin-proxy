@@ -6,7 +6,7 @@
   "max_body_bytes": 67108864,
   "rules": [
     {
-      "name": "deepseek-strict",
+      "name": "deepseek",
       "model": "deepseek",
       "match": "contains",
       "pipeline": "auto",
@@ -14,20 +14,20 @@
       "upstreams": ["deepseek"]
     },
     {
-      "name": "glm-strict",
-      "model": "glm",
+      "name": "glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "match": "contains",
       "pipeline": "auto",
       "mode": "strict",
       "upstreams": ["z-ai"]
     },
     {
-      "name": "glm-preferred-fallback",
+      "name": "glm-5.3",
       "model": "glm-5.3",
       "match": "contains",
       "pipeline": "auto",
-      "mode": "preferred",
-      "upstreams": ["z-ai", "gmicloud"]
+      "mode": "strict",
+      "upstreams": ["zai"]
     }
   ]
 }

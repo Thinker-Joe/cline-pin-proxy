@@ -95,10 +95,17 @@ const DefaultUpstream = "https://api.cline.bot/api/v1"
 // DefaultMaxBodyBytes 允许多轮长上下文请求。
 const DefaultMaxBodyBytes int64 = 64 << 20 // 64 MiB
 
-// Default 返回内置默认配置，其中包含针对 DeepSeek 与 GLM 的常用钉死规则。
+// Default 返回内置默认配置，其中包含针对 DeepSeek 与 GLM 的钉死规则。
 //
-// 默认规则只是起点：上游 slug 会随 Cline 侧渠道变动，请用 `probe` 子命令
-// 探测你账号下真实的可用渠道后再定稿。
+// 这三条规则是 2026-09-16 在真实网关上逐模型探测后确定的，不是猜的。
+// 注意两条 GLM 规则**必须**保持这个顺序，且不能合并成一条泛化的 `glm`：
+//
+//	cline-pass/glm-5.3-flash 走 direct 管道，可用上游里写的是 `z-ai`
+//	cline-pass/glm-5.3       走 planner 管道，可用上游里写的是 `zai`
+//
+// 同一家厂商在不同模型上用了两种 slug。早期版本用一条 `glm` → `z-ai` 的泛化规则，
+// 结果把 glm-5.3 打成 400（"No available providers match the 'only' filter: z-ai"）。
+// 因此这里按「具体在前、泛化在后」排列，并分别锁定各自的正确 slug。
 func Default() *Config {
 	return &Config{
 		Listen:       DefaultListen,
@@ -116,12 +123,21 @@ func Default() *Config {
 				Upstreams: []string{"deepseek"},
 			},
 			{
-				Name:      "glm",
-				Model:     "glm",
+				// 必须排在 glm-5.3 之前：前缀更具体者先匹配。
+				Name:      "glm-5.3-flash",
+				Model:     "glm-5.3-flash",
 				Match:     MatchContains,
 				Pipeline:  PipelineAuto,
 				Mode:      PinStrict,
 				Upstreams: []string{"z-ai"},
+			},
+			{
+				Name:      "glm-5.3",
+				Model:     "glm-5.3",
+				Match:     MatchContains,
+				Pipeline:  PipelineAuto,
+				Mode:      PinStrict,
+				Upstreams: []string{"zai"},
 			},
 		},
 	}
