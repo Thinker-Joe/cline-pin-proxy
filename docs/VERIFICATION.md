@@ -84,7 +84,30 @@ data.choices[0].message.provider_metadata.gateway.routing
 
 ---
 
-## 四、真实测试抓出、单测漏掉的三个 bug
+## 四、发布镜像的实跑验证
+
+在硅谷服务器上从 GHCR 匿名拉取线上镜像，以生产同款加固参数运行，测完即删：
+
+```bash
+docker pull ghcr.io/thinker-joe/cline-pin-proxy:latest
+docker run -d --name cpp-e2e-test --read-only --tmpfs /tmp \
+  -p 127.0.0.1:18787:8787 -e CLINE_PIN_API_KEY=... \
+  ghcr.io/thinker-joe/cline-pin-proxy:latest
+```
+
+| 检查项 | 结果 |
+|---|---|
+| 容器状态 | `status=running health=healthy restarts=0`（HEALTHCHECK 生效） |
+| `--read-only` + `--tmpfs /tmp` | ✅ 正常运行，说明无写盘依赖 |
+| `GET /healthz` | `{"status":"ok"}` |
+| `cline-pass/deepseek-v4.1-flash` | HTTP 200，`finalProvider=deepseek`，`fallbacks=0`，正文 `OK` |
+| `cline-pass/glm-5.3-flash` | HTTP 200，`provider=Z.AI`，`fallbacks=0`，正文 `OK` |
+| 无规则命中的模型 | `X-Cline-Pin-Rule: none` + `Note: no rule matched`，原样放行 |
+| 镜像架构 | `linux/amd64`、`linux/arm64` |
+
+---
+
+## 五、真实测试抓出、单测漏掉的三个 bug
 
 这三个都是**只有打真实流量才会暴露**的问题，共同点是：单测用的假上游太宽容。
 
@@ -125,22 +148,25 @@ https://api.cline.bot/api/v1/v1/chat/completions   →  404 Not Found
 
 ---
 
-## 五、成本
+## 六、成本
 
-整个验证过程（约 20 次真实请求，含两次探针与三次完整补全）总计远低于 $0.001。
+整个验证过程（约 25 次真实请求，含多次探针与完整补全）总计远低于 $0.001。
 `probe` 子命令按设计在路由层即失败，不走推理后端。
 
 ---
 
-## 六、未验证的部分
+## 七、未验证的部分
 
 诚实记录当前缺口：
 
-- **未在容器里跑过镜像**：镜像是 GitHub Actions 构建并推到 GHCR 的，本地无 Docker，
-  只验证了 registry 元数据（多架构、entrypoint、CA 证书、HEALTHCHECK），
-  没有实际 `docker run` 过。
-- **未做 sub2api → 代理 → Cline Pass 的串联验证**：上面第三节是把 base_url 直接指向
-  本机代理做的，没有真的改 sub2api 账号配置。
-- **未验证 arm64 运行**：只确认了 arm64 manifest 存在。
-- **上游 slug 会变**：Cline 侧渠道池随时可能调整，本文件的清单是 2026-09-16 的快照，
+- **未做 sub2api → 代理 → Cline Pass 的完整串联**：上面第三、四节都是把 base_url
+  直接指向代理做的，没有真的改动 sub2api 的账号配置。若要上线，这是推荐的第一站。
+- **未验证 arm64 实际运行**：只确认了 arm64 manifest 存在并能被拉取，没有在
+  arm64 机器上跑过。
+- **未覆盖流式下的钉死**：本文所有真实请求都是 `stream: false`。流式透传的
+  「逐块 Flush」有单测覆盖（用真实 socket 断言首块在上游仍挂起时就已到达），
+  但没有对着真实网关跑过流式钉死。
+- **上游 slug 会变**：Cline 侧渠道池随时可能调整，本文清单是 2026-09-16 的快照，
   上线前请自行 `probe` 复核。
+- **`sort` 参数未实测**：`cost` / `ttft` / `tps` 三种排序只在单测里验证了编码
+  正确，没有对真实网关验证其效果。
