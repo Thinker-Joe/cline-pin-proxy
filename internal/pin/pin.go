@@ -183,43 +183,65 @@ func toAnySlice(in []string) []any {
 
 // ExtractUpstreams 读回响应里的路由事实，供日志与验收使用。
 //
-// 两条管道的回读位置不同：
-//   - planner：provider_metadata.gateway.routing.finalProvider
-//   - direct ：顶层 provider（显示名，需要 slug 化）
+// 真实响应（2026-09 api.cline.bot 实测）里这两个字段的位置是：
+//
+//	planner：data.choices[0].message.provider_metadata.gateway.routing.finalProvider
+//	direct ：data.provider（显示名，需要 slug 化，例如 "Z.AI" -> "z-ai"）
+//
+// 注意路由元数据挂在 choices[0].message 下，不在响应顶层；同时也兼容去掉
+// data 信封、以及 provider_metadata 直接挂在 choice 上的变体。
 //
 // 返回空串表示该响应没有携带路由信息（例如错误响应）。
 func ExtractUpstreams(payload map[string]any) (finalProvider, canonicalSlug string) {
-	if routing := nestedGet(payload, "provider_metadata", "gateway", "routing"); routing != nil {
-		if m, ok := routing.(map[string]any); ok {
-			if s, ok := m["finalProvider"].(string); ok {
-				finalProvider = s
-			}
-			if s, ok := m["canonicalSlug"].(string); ok {
-				canonicalSlug = s
-			}
+	root := payload
+	if data, ok := payload["data"].(map[string]any); ok {
+		root = data
+	}
+
+	if routing, ok := routingFrom(root); ok {
+		if s, ok := routing["finalProvider"].(string); ok {
+			finalProvider = s
+		}
+		if s, ok := routing["canonicalSlug"].(string); ok {
+			canonicalSlug = s
 		}
 	}
 	if finalProvider == "" {
-		if s, ok := payload["provider"].(string); ok {
+		if s, ok := root["provider"].(string); ok {
 			finalProvider = slugify(s)
 		}
 	}
 	return finalProvider, canonicalSlug
 }
 
-func nestedGet(root map[string]any, keys ...string) any {
-	var cur any = root
-	for _, k := range keys {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil
-		}
-		cur, ok = m[k]
-		if !ok {
-			return nil
+// routingFrom 依次尝试几处已知的放置位置，返回 provider_metadata.gateway.routing。
+func routingFrom(root map[string]any) (map[string]any, bool) {
+	if choices, ok := root["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if msg, ok := choice["message"].(map[string]any); ok {
+				if r, ok := routingAt(msg); ok {
+					return r, true
+				}
+			}
+			if r, ok := routingAt(choice); ok {
+				return r, true
+			}
 		}
 	}
-	return cur
+	return routingAt(root)
+}
+
+func routingAt(node map[string]any) (map[string]any, bool) {
+	meta, ok := node["provider_metadata"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	gateway, ok := meta["gateway"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	routing, ok := gateway["routing"].(map[string]any)
+	return routing, ok
 }
 
 // slugify 把上游显示名规范成 slug，例如 "GMICloud" -> "gmicloud"、"Z.AI" -> "z-ai"。

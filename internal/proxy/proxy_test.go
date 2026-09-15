@@ -351,6 +351,62 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+// 上游基址已含版本段时，不得拼出 /v1/v1/...。
+//
+// 这是端到端测试才暴露的真实故障：调用方（如 sub2api）把 base_url 指向
+// http://proxy:8787/v1，请求路径本身就是 /v1/chat/completions，
+// 直接相加会得到 https://api.cline.bot/api/v1/v1/chat/completions → 全部 404。
+func TestPathJoiningAvoidsDuplicateVersionSegment(t *testing.T) {
+	cases := []struct {
+		name     string
+		base     string
+		path     string
+		wantPath string
+	}{
+		{"base 带 /v1 且路径也带 /v1", "https://up.example/api/v1", "/v1/chat/completions", "/api/v1/chat/completions"},
+		{"base 带 /v1 而路径不带", "https://up.example/api/v1", "/chat/completions", "/api/v1/chat/completions"},
+		{"base 带 /v1 且路径是 models", "https://up.example/api/v1", "/v1/models", "/api/v1/models"},
+		{"base 无版本段则原样拼", "https://up.example", "/v1/chat/completions", "/v1/chat/completions"},
+		{"base 版本段与路径不同则不剥离", "https://up.example/v4", "/v1/chat/completions", "/v4/v1/chat/completions"},
+		{"尾斜杠被规整", "https://up.example/api/v1/", "/v1/models", "/api/v1/models"},
+		{"非版本段不剥离", "https://up.example/gateway", "/v1/models", "/gateway/v1/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := joinUpstream(tc.base, tc.path); got != "https://up.example"+tc.wantPath {
+				t.Errorf("joinUpstream(%q, %q) = %q, want %q",
+					tc.base, tc.path, got, "https://up.example"+tc.wantPath)
+			}
+		})
+	}
+}
+
+// 端到端确认：base 带版本段时，假上游收到的路径不含重复段。
+func TestRequestReachesVersionedUpstreamBase(t *testing.T) {
+	upstream, got := newUpstream(t, nil)
+	cfg := &config.Config{
+		Upstream:     upstream.URL + "/api/v1",
+		MaxBodyBytes: 1 << 20,
+		Rules: []config.Rule{{
+			Name: "ds", Model: "deepseek", Match: config.MatchContains,
+			Pipeline: config.PipelineAuto, Mode: config.PinStrict, Upstreams: []string{"deepseek"},
+		}},
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rec := post(t, srv, "/v1/chat/completions", `{"model":"cline-pass/deepseek-v4.1-flash"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got.path != "/api/v1/chat/completions" {
+		t.Errorf("upstream saw %q, want /api/v1/chat/completions（不得出现重复版本段）", got.path)
+	}
+}
+
 // 配置了固定 key 时必须覆盖客户端凭据，而不是叠加。
 func TestFixedAPIKeyOverridesClientAuthorization(t *testing.T) {
 	upstream, got := newUpstream(t, nil)

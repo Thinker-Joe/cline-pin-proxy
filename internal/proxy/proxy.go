@@ -193,6 +193,42 @@ func pinHeaders(rule, upstreams, mode, note string) map[string]string {
 	return h
 }
 
+// joinUpstream 把客户端路径拼到上游基址上，并消掉重复的版本段。
+//
+// 调用方的 base_url 有两种常见写法，而请求路径都会是 /v1/...：
+//
+//	http://proxy:8787     客户端自己拼 -> /v1/chat/completions
+//	http://proxy:8787/v1  客户端拼端点 -> /v1/chat/completions（同样带 /v1）
+//
+// 而上游基址 https://api.cline.bot/api/v1 末尾**已经**含有版本段。
+// 若直接相加会得到 /api/v1/v1/chat/completions，上游一律回 404——
+// 这是本项目早期版本的真实故障，单测用假上游接任意路径，所以漏掉了。
+func joinUpstream(base, path string) string {
+	base = strings.TrimRight(base, "/")
+	if seg := versionSegment(base); seg != "" && strings.HasPrefix(path, "/"+seg+"/") {
+		path = strings.TrimPrefix(path, "/"+seg)
+	}
+	return base + path
+}
+
+// versionSegment 返回 base 末尾形如 v1 / v2 / v1beta 的版本段，不是则返回空。
+func versionSegment(base string) string {
+	idx := strings.LastIndexByte(base, '/')
+	if idx < 0 {
+		return ""
+	}
+	seg := base[idx+1:]
+	if len(seg) < 2 || seg[0] != 'v' {
+		return ""
+	}
+	for _, r := range seg[1:] {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') {
+			return ""
+		}
+	}
+	return seg
+}
+
 // readBody 读取请求体；失败时已经写好响应，返回 ok=false。
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	limited := http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
@@ -216,7 +252,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, ex
 		w.Header().Set(k, v)
 	}
 
-	target := strings.TrimRight(s.cfg.Upstream, "/") + r.URL.Path
+	target := joinUpstream(s.cfg.Upstream, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}

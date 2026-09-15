@@ -255,26 +255,65 @@ func TestModelOf(t *testing.T) {
 }
 
 func TestExtractUpstreams(t *testing.T) {
+	// 真实 planner 响应结构：路由元数据在 data.choices[0].message 下，不在顶层。
 	planner := map[string]any{
-		"provider_metadata": map[string]any{
-			"gateway": map[string]any{
-				"routing": map[string]any{"finalProvider": "deepseek", "canonicalSlug": "deepseek/deepseek-v4-flash"},
+		"data": map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"content": "OK",
+						"provider_metadata": map[string]any{
+							"gateway": map[string]any{
+								"routing": map[string]any{
+									"finalProvider":      "deepseek",
+									"canonicalSlug":      "deepseek/deepseek-v4.1-flash",
+									"fallbacksAvailable": []any{},
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 	}
 	fp, slug := ExtractUpstreams(planner)
-	if fp != "deepseek" || slug != "deepseek/deepseek-v4-flash" {
-		t.Errorf("planner extract = %q / %q", fp, slug)
+	if fp != "deepseek" {
+		t.Errorf("planner finalProvider = %q, want deepseek", fp)
+	}
+	if slug != "deepseek/deepseek-v4.1-flash" {
+		t.Errorf("planner canonicalSlug = %q", slug)
 	}
 
-	direct := map[string]any{"provider": "GMICloud", "model": "z-ai/glm-5.3-flash"}
-	fp, _ = ExtractUpstreams(direct)
-	if fp != "gmicloud" {
-		t.Errorf("direct extract = %q, want gmicloud", fp)
+	// 真实 direct 响应结构：顶层 provider 是显示名，需要 slug 化。
+	direct := map[string]any{
+		"data": map[string]any{
+			"provider": "Z.AI",
+			"model":    "z-ai/glm-5.3-flash",
+		},
+	}
+	if fp, _ := ExtractUpstreams(direct); fp != "z-ai" {
+		t.Errorf("direct provider = %q, want z-ai", fp)
 	}
 
-	if fp, _ := ExtractUpstreams(map[string]any{"choices": []any{}}); fp != "" {
-		t.Errorf("expected empty provider, got %q", fp)
+	// 去掉 data 信封也要能用。
+	unwrapped := map[string]any{
+		"choices": []any{
+			map[string]any{
+				"message": map[string]any{
+					"provider_metadata": map[string]any{
+						"gateway": map[string]any{"routing": map[string]any{"finalProvider": "novita"}},
+					},
+				},
+			},
+		},
+	}
+	if fp, _ := ExtractUpstreams(unwrapped); fp != "novita" {
+		t.Errorf("unwrapped finalProvider = %q, want novita", fp)
+	}
+
+	// 没有路由信息的响应必须返回空串，不能瞎猜。
+	if fp, slug := ExtractUpstreams(map[string]any{"choices": []any{}}); fp != "" || slug != "" {
+		t.Errorf("expected empty for a routing-less payload, got %q/%q", fp, slug)
 	}
 }
 

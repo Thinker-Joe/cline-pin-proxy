@@ -4,10 +4,15 @@
 // 因为不存在任何可用候选，这次请求不会走到推理后端，所以基本不消耗 token，
 // 而错误信息里会带上它当前可用的完整渠道清单。
 //
-// 两条管道吐出的错误格式不同，需要分别解析：
+// 真实响应结构（2026-09 实测，api.cline.bot）：
 //
-//	planner：错误文本里的 "Available providers are: a, b, c"
-//	direct ：错误 JSON 里的 error.metadata.available_providers
+//	{"error":"inference request failed: failed to invoke model '<slug>' from
+//	         <Vercel|Openrouter>: request failed with status <code>:
+//	         {\"error\":{\"message\":\"...\",\"metadata\":{\"available_providers\":[...]}}}",
+//	 "success":false}
+//
+// 注意外层 error 是**字符串**而不是对象，内层 JSON 被转义了一层。这个结构决定了
+// 解析不能依赖简单的 json.Unmarshal，也不能依赖引号形状敏感的正则。
 package probe
 
 import (
@@ -30,12 +35,8 @@ const impossibleUpstream = "__probe__"
 // maxErrorBytes 限制读取的错误体大小，避免异常上游把内存打满。
 const maxErrorBytes = 1 << 20 // 1 MiB
 
-var (
-	// availableProvidersRe 匹配 planner 管道的错误措辞。
-	availableProvidersRe = regexp.MustCompile(`(?i)available providers are:\s*([^.]+)`)
-	// upstreamSlugRe 过滤出合法的上游 slug，挡掉错误句子里混进来的普通单词。
-	upstreamSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-)
+// upstreamSlugRe 过滤出合法的上游 slug。
+var upstreamSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 // Result 是一次上游探测的结果。
 type Result struct {
@@ -113,6 +114,142 @@ func Probe(ctx context.Context, client *http.Client, cfg *config.Config, model, 
 	return res, nil
 }
 
+// Extract 从网关的错误响应里还原出管道类型与真实可用的上游清单。
+//
+// 返回的 pipeline 为空表示两种格式都没匹配上（网关措辞变了，或请求根本没被
+// 路由层拦下）。upstreams 已去重并保持网关给出的顺序。
+func Extract(bodyText string) (pipeline string, upstreams []string) {
+	// 网关把内层 JSON 整体转义了一层（`\"` 而非 `"`）。先还原再解析，
+	// 否则下面的 JSON 切片会因为字面反斜杠而解析失败，标记式提取也会把
+	// 最后一项与尾巴粘成的 token 判为非法。
+	text := strings.ReplaceAll(bodyText, `\"`, `"`)
+
+	// available_providers 是结构化字段，最完整且无歧义，优先用它。
+	if list := extractAvailableProvidersArray(text); len(list) > 0 {
+		return pipelineOr(text, string(config.PipelineDirect)), list
+	}
+	// planner 管道只给自然语言清单，没有结构化字段。
+	for _, marker := range []string{"available providers are", "providers serving"} {
+		if list := extractListAfterMarker(text, marker); len(list) > 0 {
+			return pipelineOr(text, string(config.PipelinePlanner)), list
+		}
+	}
+	return "", nil
+}
+
+// pipelineOr 优先用网关自己的措辞判断管道，拿不到再退回调用方给的兜底值。
+func pipelineOr(text, fallback string) string {
+	if p := detectPipeline(text); p != "" {
+		return p
+	}
+	return fallback
+}
+
+// detectPipeline 用网关错误里的来源措辞判断管道归属。
+//
+// 实测：`... from Vercel:` 对应 planner，`... from Openrouter:` 对应 direct。
+// 这比根据「哪种注入生效了」去反推更直接可靠。
+func detectPipeline(text string) string {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "from vercel"):
+		return string(config.PipelinePlanner)
+	case strings.Contains(lower, "from openrouter"):
+		return string(config.PipelineDirect)
+	}
+	return ""
+}
+
+// extractAvailableProvidersArray 抠出 available_providers 的 JSON 数组。
+//
+// 刻意不用正则：真实响应里这个字段被包在「JSON 字符串套 JSON」的双层转义中，
+// 引号前带反斜杠（形如 \"available_providers\"），引号敏感的正则很容易漏掉。
+// 逐字符定位 [ 与 ] 更稳，且上游 slug 里不含 ]。
+//
+// 输入允许是未还原转义的原文：本函数自带一次还原，便于单独调用。
+func extractAvailableProvidersArray(text string) []string {
+	text = strings.ReplaceAll(text, `\"`, `"`)
+
+	const key = "available_providers"
+	idx := strings.Index(text, key)
+	if idx < 0 {
+		return nil
+	}
+	open := strings.IndexByte(text[idx:], '[')
+	if open < 0 {
+		return nil
+	}
+	open += idx
+	closing := strings.IndexByte(text[open:], ']')
+	if closing < 0 {
+		return nil
+	}
+	closing += open
+
+	var raw []string
+	if err := json.Unmarshal([]byte(text[open:closing+1]), &raw); err != nil {
+		return nil
+	}
+	return normalizeList(raw)
+}
+
+// extractListAfterMarker 解析网关的自然语言清单，例如：
+//
+//	Available providers are: alibaba, baseten, wafer
+//	Providers serving z-ai/glm-5.3-flash-20260826: deepinfra, relace, modal, but your request's ...
+//
+// 做法：定位标记 → 跳到其后的第一个冒号 → 逐逗号读 token。
+//
+// **遇到第一个非法 slug 必须停，而不是跳过。** 实测 planner 响应的最后一项
+// `wafer` 紧跟着 `","type":"invalid_request_error"`，两者之间没有逗号，若按
+// 「跳过非法项继续扫」处理，wafer 会和整段 JSON 尾巴一起被丢掉。
+func extractListAfterMarker(text, marker string) []string {
+	idx := strings.Index(strings.ToLower(text), strings.ToLower(marker))
+	if idx < 0 {
+		return nil
+	}
+	rest := text[idx+len(marker):]
+	if colon := strings.IndexByte(rest, ':'); colon >= 0 {
+		rest = rest[colon+1:]
+	}
+
+	out := make([]string, 0, 32)
+	for _, token := range strings.Split(rest, ",") {
+		token = strings.ToLower(strings.Trim(token, " \t\r\n\"'"))
+		if !upstreamSlugRe.MatchString(token) {
+			break
+		}
+		out = append(out, token)
+	}
+	return dedupe(out)
+}
+
+// normalizeList 小写化、去空、去重，并保持原顺序。
+func normalizeList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		item = strings.ToLower(strings.TrimSpace(item))
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return dedupe(out)
+}
+
+func dedupe(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
+}
+
 // truncate 按字节截断长文本，仅供日志与诊断展示使用。
 func truncate(s string, max int) string {
 	s = strings.TrimSpace(s)
@@ -120,67 +257,4 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
-}
-
-// Extract 从网关的错误响应里还原出管道类型与真实可用的上游清单。
-//
-// 返回的 pipeline 为空表示两种格式都没匹配上（网关措辞变了，或请求根本没被
-// 路由层拦下）。upstreams 已去重并保持网关给出的顺序。
-func Extract(bodyText string) (pipeline string, upstreams []string) {
-	if match := availableProvidersRe.FindStringSubmatch(bodyText); match != nil {
-		list := parseProviderList(match[1])
-		if len(list) > 0 {
-			return string(config.PipelinePlanner), list
-		}
-	}
-
-	if list := extractDirectProviders(bodyText); len(list) > 0 {
-		return string(config.PipelineDirect), list
-	}
-	return "", nil
-}
-
-// parseProviderList 把 "a, b, c" 拆成合法的上游 slug 列表。
-func parseProviderList(segment string) []string {
-	seen := make(map[string]bool)
-	out := make([]string, 0, 8)
-	for _, token := range strings.Split(segment, ",") {
-		token = strings.ToLower(strings.TrimSpace(token))
-		if token == "" || seen[token] || !upstreamSlugRe.MatchString(token) {
-			continue
-		}
-		seen[token] = true
-		out = append(out, token)
-	}
-	return out
-}
-
-// extractDirectProviders 从 direct 管道的错误 JSON 里取出可用上游。
-// 错误文本前面可能带 HTTP 状态之类的前缀，所以从第一个 '{' 开始解析。
-func extractDirectProviders(bodyText string) []string {
-	start := strings.IndexByte(bodyText, '{')
-	if start < 0 {
-		return nil
-	}
-	var parsed struct {
-		Error struct {
-			Metadata struct {
-				AvailableProviders []string `json:"available_providers"`
-			} `json:"metadata"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(bodyText[start:]), &parsed); err != nil {
-		return nil
-	}
-	seen := make(map[string]bool)
-	out := make([]string, 0, len(parsed.Error.Metadata.AvailableProviders))
-	for _, p := range parsed.Error.Metadata.AvailableProviders {
-		p = strings.ToLower(strings.TrimSpace(p))
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-	return out
 }

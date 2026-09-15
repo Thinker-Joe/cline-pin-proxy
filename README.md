@@ -47,6 +47,11 @@ Cline Pass 的订阅模型背后不是单一上游，而是一串第三方推理
 [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher) 与
 [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) 两个独立项目的公开记录。
 
+> **实测结论（2026-09-16，真实网关）**：
+> `cline-pass/deepseek-v4.1-flash` 走 **planner**，`cline-pass/glm-5.3-flash` 走
+> **direct**，两者管道归属稳定且不同——这正是必须双写的原因。
+> 完整证据、成本数据与真实测试抓出的三个 bug 见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。
+
 ---
 
 ## 快速开始
@@ -122,13 +127,17 @@ sub2api 会拼成 `http://127.0.0.1:8787/v1/chat/completions`，正好命中代�
 
 开箱即用地钉死这两类模型（`contains` 匹配，`strict` 模式，双管道）：
 
-| 命中 | 钉到 |
-|---|---|
-| `*deepseek*` | `deepseek` |
-| `*glm*` | `z-ai` |
+| 命中 | 钉到 | 实测状态 |
+|---|---|---|
+| `*deepseek*` | `deepseek` | ✅ 2026-09-16 实测在该模型 16 个可用上游之列 |
+| `*glm*` | `z-ai` | ✅ 2026-09-16 实测在该模型 27 个可用上游之列 |
 
-⚠️ **这两个 slug 只是起点。** 上游 slug 会随 Cline 侧渠道变动，而且不同模型、
-不同管道下可用清单并不相同。**上线前请用 `probe` 子命令在你自己的账号上核实。**
+两条规则都已在真实网关上验证生效：钉 `deepseek` 得到
+`finalProvider: "deepseek"`，钉 `z-ai` 得到 `provider: "Z.AI"`，且两者的
+`fallbacksAvailable` 都变成空数组。详见 **[docs/VERIFICATION.md](docs/VERIFICATION.md)**。
+
+⚠️ 上游 slug 会随 Cline 侧渠道池变动，清单只是快照。
+**上线前请用 `probe` 子命令在你自己的账号上复核。**
 
 ### 配置文件
 
