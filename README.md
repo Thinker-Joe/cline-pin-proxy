@@ -311,7 +311,8 @@ CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；
 | [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) | CLIProxyAPI 插件（Go） | 需要 CPA 进程；双管道注入设计一致 |
 | **本项目** | 单文件 Go 代理 | **只要钉死这一件事**：无账号池、无 UI、无状态，约 5 MB 镜像 |
 
-本项目的双管道知识来自上述项目的公开实测记录，未复制其代码。详见 [LICENSE](LICENSE) 末尾的致谢段。
+本项目的双管道知识来自上述项目的公开实测记录，**未复制其源代码**。
+详见 [NOTICE](NOTICE)。
 
 ---
 

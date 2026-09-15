@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-The two-pipeline routing behavior implemented here (the planner pipeline using
-`providerOptions.gateway.*`, the direct pipeline using top-level `provider.*`,
-and the zero-token upstream enumeration trick) was derived from the publicly
-documented findings of these MIT-licensed projects:
-
-- https://github.com/munmunjaklin458-afk/cline-pass-switcher
-- https://github.com/Stabilize7440/cpagw-gateway
-- https://github.com/yhshzh/dsh-cline-pass

@@ -1,0 +1,22 @@
+# NOTICE
+
+本项目采用 [MIT 许可证](LICENSE)。
+
+## 知识来源与致谢
+
+本项目实现的核心行为——Cline Pass 网关的**双管道分流**，以及**零 token 枚举上游**
+的技巧——并非原创发现，而是来自以下 MIT 许可项目的公开实测记录：
+
+| 项目 | 本项目借鉴的内容 |
+|---|---|
+| [munmunjaklin458-afk/cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher) | 两条管道的存在与识别方式；planner 管道下顶层 `provider.only` 会被网关丢弃、必须用 `providerOptions.gateway.*`；`__probe__` 假上游枚举技巧 |
+| [Stabilize7440/cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) | 双管道「同时注入」策略；无规则时纯净放行的设计原则 |
+| [yhshzh/dsh-cline-pass](https://github.com/yhshzh/dsh-cline-pass) | 管道探测与回读路由元数据（`finalProvider` / `canonicalSlug`）的方式 |
+
+**本项目未复制上述项目的任何源代码。** 上述结论属于对公开 API 行为的事实性发现，
+本项目基于这些事实用 Go 独立实现。若其中任何一方认为本说明不准确，请提 issue。
+
+## 免责声明
+
+本项目只做请求转发与字段注入，不代理鉴权、不存储凭据。使用本项目可能受
+Cline Pass 及其上游服务商的服务条款约束，请自行评估合规性。
