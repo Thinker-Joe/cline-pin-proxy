@@ -1,0 +1,24 @@
+# 仓库内一律使用 LF。
+#
+# 这台开发机的 core.autocrlf=true，若不显式声明，Dockerfile 的续行、
+# shell 片段和 YAML 会以 CRLF 入库，在 Linux CI 上可能直接构建失败。
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+Dockerfile    text eol=lf
+.dockerignore text eol=lf
+.gitignore    text eol=lf
+LICENSE       text eol=lf
+
+*.exe   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary

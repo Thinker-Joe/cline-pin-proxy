@@ -1,0 +1,54 @@
+# cline-pin-proxy 的最小部署编排。
+#
+# 设计前提：代理与调用方（例如 sub2api）通常同机，因此只绑回环，
+# 不对公网暴露任何端口。
+#
+# 用法：
+#   CLINE_PIN_API_KEY=sk_xxx docker compose up -d
+#
+# 内置默认规则已经覆盖 DeepSeek 与 GLM，所以只给一个 key 就能跑起来。
+
+services:
+  cline-pin-proxy:
+    image: ghcr.io/thinker-joe/cline-pin-proxy:latest
+    # 需要从源码构建时取消下面这行的注释（会自动覆盖上面的 image）
+    # build: .
+    container_name: cline-pin-proxy
+    restart: unless-stopped
+
+    ports:
+      # 只绑 127.0.0.1：仅本机进程可达，公网无法访问。
+      - "127.0.0.1:8787:8787"
+
+    environment:
+      CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-https://api.cline.bot/api/v1}
+      # 固定上游密钥。留空则透传调用方传来的 Authorization。
+      CLINE_PIN_API_KEY: ${CLINE_PIN_API_KEY:-}
+      CLINE_PIN_LOG_LEVEL: ${CLINE_PIN_LOG_LEVEL:-info}
+      # Cline 网关会看这个头；调用方（如 sub2api 的 header_override）常配它。
+      CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-x-client-type}
+
+    # 需要自定义规则时：复制 config.example.json 为 config.json 并取消注释。
+    # volumes:
+    #   - ./config.json:/etc/cline-pin-proxy/config.json:ro
+    # command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/cline-pin-proxy", "healthcheck", "-url", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 代理是纯转发，不需要任何特权；显式收紧。
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.github
+*.exe
+*.log
+coverage.out
+config.json
+dist/
+docs/
+README.md

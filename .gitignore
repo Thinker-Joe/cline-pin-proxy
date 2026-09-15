@@ -1,0 +1,19 @@
+# 构建产物
+/cline-pin-proxy
+/cline-pin-proxy.exe
+/dist/
+*.exe
+
+# 本地配置可能含密钥，绝不入库
+/config.json
+config.local.json
+
+# 测试与覆盖率
+coverage.out
+*.test
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

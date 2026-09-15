@@ -1,0 +1,33 @@
+{
+  "listen": "127.0.0.1:8787",
+  "upstream": "https://api.cline.bot/api/v1",
+  "api_key": "",
+  "forward_headers": ["x-client-type"],
+  "max_body_bytes": 67108864,
+  "rules": [
+    {
+      "name": "deepseek-strict",
+      "model": "deepseek",
+      "match": "contains",
+      "pipeline": "auto",
+      "mode": "strict",
+      "upstreams": ["deepseek"]
+    },
+    {
+      "name": "glm-strict",
+      "model": "glm",
+      "match": "contains",
+      "pipeline": "auto",
+      "mode": "strict",
+      "upstreams": ["z-ai"]
+    },
+    {
+      "name": "glm-preferred-fallback",
+      "model": "glm-5.3",
+      "match": "contains",
+      "pipeline": "auto",
+      "mode": "preferred",
+      "upstreams": ["z-ai", "gmicloud"]
+    }
+  ]
+}

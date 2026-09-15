@@ -1,0 +1,321 @@
+// Command cline-pin-proxy 是一个把 Cline Pass 的上游渠道钉死的透传代理。
+//
+// 它解决一个很具体的问题：Cline Pass 订阅模型背后有多个推理上游（deepseek、
+// z-ai、baseten、novita……），由 Cline 网关自行调度，客户端无法控制实际走哪家。
+// 而这个网关内部有两条互不相同的分流管道，钉死写法完全不同：
+//
+//	planner（Vercel AI Gateway）：只认 providerOptions.gateway.{only,order,sort}
+//	direct （OpenRouter）        ：只认顶层 provider.{only,order,sort}
+//
+// 本代理在请求进入 Cline Pass 之前把两份写法都注入进去，让每条管道各取所需。
+//
+// 用法：
+//
+//	cline-pin-proxy serve   -config config.json
+//	cline-pin-proxy probe   -model cline-pass/deepseek-v4.1-flash
+//	cline-pin-proxy check   -config config.json -model deepseek-v4-flash
+//	cline-pin-proxy version
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/config"
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/probe"
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/proxy"
+)
+
+// version 由构建时通过 -ldflags "-X main.version=..." 注入。
+var version = "dev"
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	sub := "serve"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+
+	switch sub {
+	case "serve":
+		return runServe(args)
+	case "probe":
+		return runProbe(args)
+	case "check":
+		return runCheck(args)
+	case "healthcheck":
+		return runHealthcheck(args)
+	case "version":
+		fmt.Println("cline-pin-proxy", version)
+		return nil
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	default:
+		return fmt.Errorf("unknown subcommand %q (want serve|probe|check|version)", sub)
+	}
+}
+
+func usage() {
+	fmt.Print(`cline-pin-proxy - 钉死 Cline Pass 的上游渠道
+
+子命令:
+  serve        启动透传代理（默认）
+  probe        探测某个模型背后真实可用的上游渠道（零 token 开销）
+  check        校验配置并预览规则匹配结果
+  healthcheck  探测本地 /healthz，供容器 HEALTHCHECK 使用
+  version      打印版本
+
+示例:
+  cline-pin-proxy serve -config config.json
+  cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
+  cline-pin-proxy check -config config.json -model deepseek-v4-flash
+  cline-pin-proxy healthcheck -url http://127.0.0.1:8787/healthz
+
+环境变量:
+  CLINE_PIN_LISTEN             监听地址
+  CLINE_PIN_UPSTREAM           Cline Pass 基址
+  CLINE_PIN_API_KEY            固定上游 API Key（为空则透传客户端凭据）
+  CLINE_PIN_FORWARD_HEADERS    额外透传的请求头，逗号分隔
+  CLINE_PIN_MAX_BODY_BYTES     请求体上限
+  CLINE_PIN_RULES              规则表 JSON，覆盖配置文件
+  CLINE_PIN_LOG_LEVEL          日志级别 debug|info|warn|error
+`)
+}
+
+func runServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径（可选）")
+	listen := fs.String("listen", "", "覆盖监听地址")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	if v := strings.TrimSpace(*listen); v != "" {
+		cfg.Listen = v
+	}
+
+	logger := newLogger()
+	srv := proxy.New(cfg, logger)
+
+	httpServer := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		// 刻意不设 WriteTimeout：流式生成可能持续数分钟，会被硬砍断。
+		IdleTimeout: 120 * time.Second,
+	}
+
+	logger.Info("cline-pin-proxy starting",
+		"version", version,
+		"listen", cfg.Listen,
+		"upstream", cfg.Upstream,
+		"rules", len(cfg.Rules),
+		"fixed_api_key", cfg.APIKey != "",
+	)
+	for _, r := range cfg.Rules {
+		logger.Info("rule loaded",
+			"name", r.Name, "model", r.Model, "match", string(r.Match),
+			"upstreams", strings.Join(r.Upstreams, ">"),
+			"mode", string(r.Mode), "pipeline", string(r.Pipeline))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		return nil
+	}
+}
+
+func runProbe(args []string) error {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径（可选）")
+	model := fs.String("model", "", "要探测的模型 ID，例如 cline-pass/deepseek-v4.1-flash")
+	pipeline := fs.String("pipeline", "auto", "强制管道：auto|planner|direct")
+	apiKey := fs.String("api-key", "", "覆盖 API Key")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*model) == "" {
+		return errors.New("probe: -model is required")
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	if v := strings.TrimSpace(*apiKey); v != "" {
+		cfg.APIKey = v
+	}
+	if cfg.APIKey == "" {
+		return errors.New("probe: 缺少 API Key，请设置 CLINE_PIN_API_KEY 或传 -api-key")
+	}
+
+	client := &http.Client{Timeout: 90 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	res, err := probe.Probe(ctx, client, cfg, strings.TrimSpace(*model), *pipeline)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("模型      : %s\n", res.Model)
+	fmt.Printf("上游状态码: %d\n", res.Status)
+	if res.Pipeline == "" {
+		fmt.Printf("管道      : 未识别（网关措辞可能已变化）\n")
+	} else {
+		fmt.Printf("管道      : %s\n", res.Pipeline)
+	}
+	if len(res.Upstreams) == 0 {
+		fmt.Printf("可用上游  : 未能解析\n")
+		if res.Detail != "" {
+			fmt.Printf("原始片段  : %s\n", res.Detail)
+		}
+		return nil
+	}
+
+	fmt.Printf("可用上游  : %d 个\n", len(res.Upstreams))
+	for i, u := range res.Upstreams {
+		fmt.Printf("  %2d. %s\n", i+1, u)
+	}
+
+	rule := config.Rule{
+		Name:      "pin-" + sanitizeName(res.Model),
+		Model:     res.Model,
+		Match:     config.MatchExact,
+		Pipeline:  config.PipelineAuto,
+		Mode:      config.PinStrict,
+		Upstreams: []string{res.Upstreams[0]},
+	}
+	suggested, err := json.MarshalIndent([]config.Rule{rule}, "", "  ")
+	if err == nil {
+		fmt.Printf("\n可直接粘贴进 config.json 的 rules（默认钉第一个上游，可按需改）：\n%s\n", suggested)
+	}
+	return nil
+}
+
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '/' || r == '.':
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func runCheck(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	configPath := fs.String("config", "", "配置文件路径（可选）")
+	model := fs.String("model", "", "可选：预览该模型会命中哪条规则")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("配置无效: %w", err)
+	}
+
+	fmt.Println("配置校验通过")
+	fmt.Printf("  监听地址  : %s\n", cfg.Listen)
+	fmt.Printf("  上游基址  : %s\n", cfg.Upstream)
+	fmt.Printf("  固定 Key  : %v\n", cfg.APIKey != "")
+	fmt.Printf("  请求体上限: %d 字节\n", cfg.MaxBodyBytes)
+	fmt.Printf("  透传请求头: %s\n", strings.Join(cfg.ForwardHeaders, ", "))
+	fmt.Printf("  规则数    : %d\n", len(cfg.Rules))
+	for i, r := range cfg.Rules {
+		fmt.Printf("    [%d] %-16s model=%-24s match=%-8s upstreams=%-28s mode=%-9s pipeline=%s\n",
+			i, r.Name, r.Model, r.Match, strings.Join(r.Upstreams, ">"), r.Mode, r.Pipeline)
+	}
+
+	if m := strings.TrimSpace(*model); m != "" {
+		if r, ok := cfg.Match(m); ok {
+			fmt.Printf("\n模型 %q 命中规则 %q → 钉到 %s（%s）\n",
+				m, r.Name, strings.Join(r.Upstreams, ">"), r.Mode)
+		} else {
+			fmt.Printf("\n模型 %q 未命中任何规则 → 将纯净透传，由 Cline Pass 自主路由\n", m)
+		}
+	}
+	return nil
+}
+
+// runHealthcheck 探测本进程的 /healthz，供容器 HEALTHCHECK 使用。
+//
+// 单独做成子命令而不是依赖 curl/wget：镜像基于 distroless，里面没有任何
+// shell 或 HTTP 客户端，只能靠二进制自己探自己。
+func runHealthcheck(args []string) error {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	url := fs.String("url", "http://127.0.0.1:8787/healthz", "健康检查地址")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(*url)
+	if err != nil {
+		return fmt.Errorf("healthcheck: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck: unexpected status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func newLogger() *slog.Logger {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLINE_PIN_LOG_LEVEL"))) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
