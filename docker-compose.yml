@@ -3,10 +3,13 @@
 # 设计前提：代理与调用方（例如 sub2api）通常同机，因此只绑回环，
 # 不对公网暴露任何端口。
 #
-# 用法：
-#   CLINE_PIN_API_KEY=sk_xxx docker compose up -d
+# 用法（开箱即用，三步）：
+#   1) mkdir -p data && cp config.example.json data/config.json
+#   2) 编辑 data/config.json，按需加规则、设 admin_token
+#   3) CLINE_PIN_API_KEY=sk_xxx docker compose up -d
 #
-# 内置默认规则已经覆盖 DeepSeek 与 GLM，所以只给一个 key 就能跑起来。
+# 之后**改 data/config.json 不用重启**：进程会按 watch_seconds 轮询热重载。
+# （compose 察觉不到挂载文件的内容变化，重启容器对配置修改其实无效。）
 
 services:
   cline-pin-proxy:
@@ -28,10 +31,12 @@ services:
       # Cline 网关会看这个头；调用方（如 sub2api 的 header_override）常配它。
       CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-x-client-type}
 
-    # 需要自定义规则时：复制 config.example.json 为 config.json 并取消注释。
-    # volumes:
-    #   - ./config.json:/etc/cline-pin-proxy/config.json:ro
-    # command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
+    # 配置走整个目录而不是单个文件：文件不存在时 compose 会把 bind 源建成
+    # **目录**，那是很难排查的坑；挂目录则天然安全，且 config.json 缺失时
+    # 进程会以默认值启动（随后把它创建出来即可被热重载接管）。
+    volumes:
+      - ./data:/etc/cline-pin-proxy
+    command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
 
     healthcheck:
       test: ["CMD", "/usr/local/bin/cline-pin-proxy", "healthcheck", "-url", "http://127.0.0.1:8787/healthz"]

@@ -88,6 +88,17 @@ type Config struct {
 	ProbeHeaders map[string]string `json:"probe_headers"`
 	// MaxBodyBytes 是允许读取的最大请求体字节数。
 	MaxBodyBytes int64 `json:"max_body_bytes"`
+	// WatchSeconds 是配置文件热重载的轮询间隔（秒）。0 表示关闭热重载。
+	//
+	// 有了它，改配置不再需要重建容器——这一点在 Docker 下尤其重要，因为
+	// config.json 是挂载文件，`docker compose up -d` 察觉不到内容变化，
+	// 而配置只在进程启动时读取。
+	WatchSeconds int `json:"watch_seconds"`
+	// AdminToken 非空时启用管理 API（/admin/*），并要求携带该令牌。
+	AdminToken string `json:"admin_token"`
+	// AdminAllowUnauthenticated 在未设置 token 时也启用管理 API。
+	// 仅在只绑回环、且确定没有其它本机进程会访问时开启。
+	AdminAllowUnauthenticated bool `json:"admin_allow_unauthenticated"`
 	// Rules 是钉死规则表。
 	Rules []Rule `json:"rules"`
 }
@@ -100,6 +111,9 @@ const DefaultUpstream = "https://api.cline.bot/api/v1"
 
 // DefaultMaxBodyBytes 允许多轮长上下文请求。
 const DefaultMaxBodyBytes int64 = 64 << 20 // 64 MiB
+
+// DefaultWatchSeconds 是配置文件热重载的默认轮询间隔。
+const DefaultWatchSeconds = 5
 
 // Default 返回内置默认配置，其中包含针对 DeepSeek 与 GLM 的钉死规则。
 //
@@ -125,6 +139,7 @@ func Default() *Config {
 		Listen:       DefaultListen,
 		Upstream:     DefaultUpstream,
 		MaxBodyBytes: DefaultMaxBodyBytes,
+		WatchSeconds: DefaultWatchSeconds,
 		// Cline 网关会用这个头区分调用方，上游侧常见配置依赖它，因此默认透传。
 		ForwardHeaders: []string{"x-client-type"},
 		// 探测时也要带上同一个头，否则部分模型（如 deepseek/... 规范名）
@@ -200,6 +215,19 @@ func applyEnv(cfg *Config) {
 			cfg.MaxBodyBytes = n
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_WATCH_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.WatchSeconds = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_ADMIN_TOKEN")); v != "" {
+		cfg.AdminToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.AdminAllowUnauthenticated = b
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_FORWARD_HEADERS")); v != "" {
 		cfg.ForwardHeaders = splitList(v)
 	}
@@ -261,6 +289,10 @@ func (c *Config) Normalize() error {
 		c.MaxBodyBytes = DefaultMaxBodyBytes
 	}
 	c.APIKey = strings.TrimSpace(c.APIKey)
+	c.AdminToken = strings.TrimSpace(c.AdminToken)
+	if c.WatchSeconds < 0 {
+		c.WatchSeconds = 0
+	}
 
 	seen := make(map[string]bool, len(c.ForwardHeaders))
 	headers := make([]string, 0, len(c.ForwardHeaders))

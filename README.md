@@ -2,7 +2,7 @@
 
 把 [Cline Pass](https://cline.bot/cline-pass) 订阅模型背后的**上游渠道钉死**的一个轻量透传代理。
 
-单文件 Go 程序，**零第三方依赖**，约 1.5k 行（含测试），distroless 镜像约 5 MB。
+单文件 Go 程序，**零第三方依赖**，约 2.1k 行源码 + 2.1k 行测试，distroless 镜像约 5 MB。
 
 ```
 你的调用方  ──►  cline-pin-proxy  ──►  Cline Pass  ──►  指定上游
@@ -60,12 +60,17 @@ Cline Pass 的订阅模型背后不是单一上游，而是一串第三方推理
 ### Docker（推荐）
 
 ```bash
-# 内置默认规则已覆盖 DeepSeek 与 GLM，给个 key 就能跑
+# 1) 准备配置（内置默认规则已覆盖 DeepSeek 与 GLM，可以先不改）
+mkdir -p data && cp config.example.json data/config.json
+
+# 2) 起服务
 CLINE_PIN_API_KEY=sk_xxx docker compose up -d
 
-# 确认活着
+# 3) 确认活着
 curl -s http://127.0.0.1:8787/healthz
 ```
+
+配置文件挂在 `./data/config.json`，**改它不用重启容器** —— 见[热重载](#热重载)。
 
 镜像也已发布到 GHCR：
 
@@ -150,7 +155,7 @@ sub2api 会拼成 `http://127.0.0.1:8787/v1/chat/completions`，正好命中代�
 ### 配置文件
 
 ```bash
-cp config.example.json config.json
+cp config.example.json config.json      # Docker 部署则是 data/config.json
 ```
 
 ```json
@@ -161,6 +166,11 @@ cp config.example.json config.json
   "forward_headers": ["x-client-type"],
   "probe_headers": { "x-client-type": "cline-cli" },
   "max_body_bytes": 67108864,
+
+  "watch_seconds": 5,
+  "admin_token": "",
+  "admin_allow_unauthenticated": false,
+
   "rules": [
     {
       "name": "deepseek-official",
@@ -171,18 +181,20 @@ cp config.example.json config.json
       "upstreams": ["deepseek"]
     },
     {
-      "name": "glm-prefer-zai",
-      "model": "glm",
+      "name": "glm-prefer-fast",
+      "model": "glm-5.3",
       "match": "contains",
       "pipeline": "auto",
       "mode": "preferred",
-      "upstreams": ["z-ai", "gmicloud"]
+      "upstreams": ["friendli", "z-ai", "gmicloud"]
     }
   ]
 }
 ```
 
 ### 字段说明
+
+**规则（`rules[]`）**
 
 | 字段 | 取值 | 说明 |
 |---|---|---|
@@ -196,6 +208,94 @@ cp config.example.json config.json
 
 **规则按数组顺序匹配，首个命中者生效。** 放具体的规则在前面，宽泛的放后面。
 
+**进程级**
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `listen` | `127.0.0.1:8787` | 监听地址。**只在启动时读取一次**，改它需要重启 |
+| `upstream` | `https://api.cline.bot/api/v1` | Cline Pass 基址 |
+| `api_key` | 空 | 固定上游密钥；留空则透传调用方的 `Authorization` |
+| `forward_headers` | `["x-client-type"]` | 白名单外额外透传给上游的请求头 |
+| `probe_headers` | `{"x-client-type":"cline-cli"}` | `probe` 子命令附带的请求头 |
+| `max_body_bytes` | 67108864 | 请求体上限 |
+| `watch_seconds` | `5` | 配置热重载轮询间隔；`0` 关闭热重载。**启动时读取一次** |
+| `admin_token` | 空 | 管理 API 令牌；留空且未开 `admin_allow_unauthenticated` 时管理 API 整体不可见 |
+| `admin_allow_unauthenticated` | `false` | 显式允许无令牌访问管理 API（仅限完全可信的本机环境） |
+
+`listen` 与 `watch_seconds` **只在启动时读取一次**（前者无法在不中断连接的前提下重新绑定，
+后者要改的是轮询循环本身）；**其余字段全部参与热重载**，包括 `admin_token` ——
+管理接口在每个请求上按当前配置判定，所以换令牌不需要重启。
+
+### 热重载
+
+改配置文件即生效，**不需要重启进程，也不需要重建容器**：
+
+```bash
+# 直接编辑挂载出来的文件
+vim data/config.json
+```
+
+进程按 `watch_seconds` 轮询文件修改时间，发现变化就重新解析并原子替换生效配置。
+日志会打出 `config reloaded`：
+
+```json
+{"level":"INFO","msg":"config reloaded","path":"/etc/cline-pin-proxy/config.json","rules":4}
+```
+
+两个安全约定：
+
+- **解析失败不会导致中断**。坏配置被拒绝，**上一份好配置继续生效**，同时打 WARN 日志。
+- **文件被删除也不会中断**。配置回落到上次成功的值，等文件重新出现后再接管。
+
+> 为什么不做成 `docker compose restart`：容器重启只能重读**镜像里**的配置，
+> 挂载文件的内容变化 compose 是察觉不到的。没有热重载就得 `--force-recreate`，
+> 而它对「改一个 slug 试试速度」这种高频操作太重了。
+
+### 管理 API
+
+用 `admin_token` 打开（或显式 `admin_allow_unauthenticated: true`）。
+**未配置令牌时整组路由返回 404**，不是 403 —— 不向扫描者暴露「这里有个管理面」。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/admin/config` | 查看当前生效配置（**自动隐去 `api_key` 与 `admin_token`**） |
+| `GET` | `/admin/rules` | 查看规则 |
+| `PUT` | `/admin/rules` | 替换规则：立即生效，并尽力写回配置文件 |
+| `POST` | `/admin/probe` | 探测某模型可用上游：`{"model":"...","pipeline":"auto"}` |
+| `POST` | `/admin/reload` | 强制重新读取配置文件 |
+
+认证方式二选一：`Authorization: Bearer <token>` 或 `X-Admin-Token: <token>`。
+
+```bash
+TOKEN=$(python3 -c 'import json;print(json.load(open("data/config.json"))["admin_token"])')
+
+# 看看现在钉的是什么
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/rules | jq
+
+# 热更新规则（不需要重启）
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '[{"name":"glm","model":"glm-5.3","match":"contains","mode":"strict","upstreams":["friendli"]}]' \
+     http://127.0.0.1:8787/admin/rules
+# {"ok":true,"applied":true,"persisted":true,"rules":1}
+
+# 加个新模型前先看看有哪些渠道
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"model":"cline-pass/glm-5.3"}' http://127.0.0.1:8787/admin/probe | jq
+```
+
+`PUT /admin/rules` 的响应字段：
+
+- `applied` —— 是否已在本进程生效（只要规则合法就是 `true`，与落盘无关）。
+- `persisted` —— 是否成功写回配置文件。**写回失败不影响生效**，
+  响应会同时给出 `persist_error` 与 `hint`，规则最迟在下一次重启后消失。
+
+> **Docker 下写回失败是正常现象，不是 bug**。容器以 nonroot（uid 65532）运行，
+> 而 compose 建出来的 `./data` 属于 root，原子替换需要**目录**可写。
+> 代理会自动退化为原地覆盖并打 WARN；若宿主目录同样不可写，就只生效不落盘。
+> 想让它落盘：`sudo chown -R 65532:65532 data`。
+> 也可以干脆不用 API —— 直接编辑 `data/config.json`，热重载等价且更可审计。
+
 ### 环境变量
 
 | 变量 | 说明 |
@@ -207,7 +307,13 @@ cp config.example.json config.json
 | `CLINE_PIN_PROBE_HEADERS` | `probe` 附带的请求头，`name: value` 逗号分隔 |
 | `CLINE_PIN_MAX_BODY_BYTES` | 请求体上限，默认 64 MiB |
 | `CLINE_PIN_RULES` | 规则表 JSON，整体覆盖配置文件 |
+| `CLINE_PIN_WATCH_SECONDS` | 热重载轮询间隔秒数；`0` 关闭 |
+| `CLINE_PIN_ADMIN_TOKEN` | 管理 API 令牌 |
+| `CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED` | `true` 时允许无令牌访问管理 API |
 | `CLINE_PIN_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
+
+> 配置里的 `api_key`、`admin_token` 属敏感字段，**环境变量的值不会被写回配置文件** ——
+> 通过 `PUT /admin/rules` 落盘时只替换 `rules` 键，其余内容原样保留。
 
 ---
 
@@ -314,7 +420,10 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
 - 响应头同样白名单，且刻意不转发 `Content-Length`（注入会改变长度）。
 - 路径白名单限制在 `/v1/` 与 `/api/v1/`，代理不会变成访问上游任意路径的跳板。
 - 请求体有大小上限，超限返回 413 而不是把内存读满。
-- 配置里的 `api_key` 是明文。别把 `config.json` 提交进 git（`.gitignore` 已排除）。
+- **管理 API 默认整体关闭**（未设 `admin_token` 时返回 404 而非 403），
+  令牌比较用 `crypto/subtle` 常量时间实现；`GET /admin/config` 会隐去
+  `api_key` 与 `admin_token`，避免把密钥回显给调用方。
+- 配置里的 `api_key` 是明文。别把 `config.json` / `data/` 提交进 git（`.gitignore` 已排除）。
 
 ---
 
@@ -328,7 +437,8 @@ gofmt -l .                 # 应为空
 go test -cover ./...
 ```
 
-覆盖率：`config` 94.8% / `pin` 97.5% / `probe` 92.0% / `proxy` 83.8%。
+覆盖率：`admin` 96.0% / `pin` 96.1% / `probe` 92.0% / `config` 88.6% / `proxy` 84.1%
+（`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支）。
 
 CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；
 打 tag 时构建 `linux/amd64`、`linux/arm64` 多架构镜像推到 GHCR，

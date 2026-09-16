@@ -1,0 +1,268 @@
+// Package admin 提供运行期的配置读取、规则替换与上游探测接口。
+//
+// 存在的理由：Docker 部署下改配置原本有两个硬摩擦——config.json 是挂载文件，
+// compose 察觉不到内容变化因而不会重建容器；而 distroless 镜像里没有 shell，
+// 探测上游只能靠 `docker run --rm --entrypoint ...` 绕一圈。
+//
+// 本包把这两件事都变成 HTTP 调用，可脚本化、可远程执行。
+package admin
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/config"
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/probe"
+)
+
+// maxAdminBodyBytes 限制管理接口的请求体，防止误传大文件把内存打满。
+const maxAdminBodyBytes = 1 << 20 // 1 MiB
+
+// RuleStore 是管理接口需要的配置能力。
+type RuleStore interface {
+	Current() *config.Config
+	SetRules(rules []config.Rule) (persisted bool, persistErr error, err error)
+	Reload() (bool, error)
+}
+
+// Prober 执行一次上游探测。由调用方注入，便于测试与解耦。
+type Prober interface {
+	Probe(ctx context.Context, model, pipeline string) (probe.Result, error)
+}
+
+// Handler 是 /admin/* 的处理器。
+type Handler struct {
+	store  RuleStore
+	prober Prober
+	log    *slog.Logger
+}
+
+// NewHandler 构造管理接口处理器。
+func NewHandler(store RuleStore, prober Prober, log *slog.Logger) *Handler {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Handler{store: store, prober: prober, log: log}
+}
+
+// Register 把管理端点挂到 mux 上。
+//
+// 端点始终注册，由 guard 在每个请求上按当前配置决定放行、鉴权还是返回 404。
+// 这样 token 改动可以随配置热重载立即生效，无需重启。
+func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/admin/config", h.guard(h.handleConfig))
+	mux.HandleFunc("/admin/rules", h.guard(h.handleRules))
+	mux.HandleFunc("/admin/probe", h.guard(h.handleProbe))
+	mux.HandleFunc("/admin/reload", h.guard(h.handleReload))
+}
+
+// guard 实现管理接口的启用开关与令牌鉴权。
+//
+// 未配置令牌且未显式允许匿名时返回 404 而非 401：不向未授权者暴露
+// 「此处存在管理接口」这一事实。
+func (h *Handler) guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := h.store.Current()
+		token := strings.TrimSpace(cfg.AdminToken)
+
+		if token == "" && !cfg.AdminAllowUnauthenticated {
+			notFound(w)
+			return
+		}
+		if token != "" && !tokenMatches(r, token) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="cline-pin-proxy"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": map[string]string{
+					"message": "invalid or missing admin token",
+					"type":    "auth_error",
+				},
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// tokenMatches 从 Authorization 或 X-Admin-Token 取令牌并做常量时间比较。
+func tokenMatches(r *http.Request, want string) bool {
+	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	got = strings.TrimSpace(got)
+	if got == "" {
+		got = strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	}
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// handleConfig 返回当前生效配置。api_key 与 admin_token 一律不下发。
+func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	cfg := h.store.Current()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"listen":              cfg.Listen,
+		"upstream":            cfg.Upstream,
+		"forward_headers":     cfg.ForwardHeaders,
+		"probe_headers":       cfg.ProbeHeaders,
+		"max_body_bytes":      cfg.MaxBodyBytes,
+		"watch_seconds":       cfg.WatchSeconds,
+		"admin_auth_required": strings.TrimSpace(cfg.AdminToken) != "",
+		"rules":               cfg.Rules,
+	})
+}
+
+// handleRules 读取或整体替换规则表。
+//
+// PUT 会立即生效；若配置文件可写则同时写回，否则返回 persist_error 与提示。
+func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"rules": h.store.Current().Rules})
+
+	case http.MethodPut:
+		var body struct {
+			Rules []config.Rule `json:"rules"`
+		}
+		if err := decodeJSON(r, &body); err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+
+		persisted, persistErr, err := h.store.SetRules(body.Rules)
+		if err != nil {
+			// 校验失败时不改动任何状态，调用方可以修正后重试。
+			badRequest(w, err.Error())
+			return
+		}
+
+		h.log.Info("rules updated via admin api",
+			"count", len(body.Rules), "persisted", persisted)
+
+		resp := map[string]any{
+			"ok":        true,
+			"applied":   true,
+			"persisted": persisted,
+			"rules":     h.store.Current().Rules,
+		}
+		if persistErr != nil {
+			resp["persist_error"] = persistErr.Error()
+			resp["hint"] = "规则已生效但未写回文件；若配置以只读方式挂载，请改为可写，" +
+				"或直接编辑配置文件（会自动热重载）"
+		}
+		writeJSON(w, http.StatusOK, resp)
+
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPut)
+	}
+}
+
+// handleProbe 探测某个模型背后可用的上游渠道。
+//
+// 让容器部署无需 shell 就能探测——此前只能靠
+// `docker run --rm --entrypoint /usr/local/bin/cline-pin-proxy`。
+func (h *Handler) handleProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var body struct {
+		Model    string `json:"model"`
+		Pipeline string `json:"pipeline"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	if model == "" {
+		badRequest(w, "model is required")
+		return
+	}
+
+	res, err := h.prober.Probe(r.Context(), model, body.Pipeline)
+	if err != nil {
+		h.log.Warn("admin probe failed", "model", model, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "upstream_error"},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleReload 强制从文件重载配置，忽略修改时间。
+func (h *Handler) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	changed, err := h.store.Reload()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "config_error"},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"changed": changed,
+		"rules":   h.store.Current().Rules,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+// decodeJSON 严格解析请求体：限制体积并拒绝未知字段，避免拼错的参数被静默忽略。
+func decodeJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxAdminBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		body = []byte(`{"error":{"message":"failed to encode response","type":"internal_error"}}`)
+		status = http.StatusInternalServerError
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func badRequest(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+	})
+}
+
+func notFound(w http.ResponseWriter) {
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"error": map[string]string{"message": "not found", "type": "not_found"},
+	})
+}
+
+func methodNotAllowed(w http.ResponseWriter, allowed ...string) {
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+		"error": map[string]string{
+			"message": "method not allowed, use " + strings.Join(allowed, " or "),
+			"type":    "method_not_allowed",
+		},
+	})
+}

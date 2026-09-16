@@ -55,8 +55,11 @@ var hopByHopHeaders = map[string]bool{
 }
 
 // Server 是透传代理。
+//
+// cfg 是配置**源**而不是快照：规则可以在运行期被热重载或管理 API 替换，
+// 每个请求读一次当前值（原子 load，无锁）即可拿到最新规则。
 type Server struct {
-	cfg    *config.Config
+	cfg    config.Source
 	client *http.Client
 	log    *slog.Logger
 }
@@ -65,7 +68,7 @@ type Server struct {
 //
 // 客户端刻意不设 http.Client.Timeout：流式生成可能持续数分钟，整体超时会把
 // 长回答硬砍断。超时控制改由 dial / TLS / 响应头三段分别设置。
-func New(cfg *config.Config, log *slog.Logger) *Server {
+func New(cfg config.Source, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -90,11 +93,19 @@ func New(cfg *config.Config, log *slog.Logger) *Server {
 	}
 }
 
-// Handler 返回代理的 HTTP 处理器。
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
+// Register 把代理路由挂到 mux 上。
+//
+// 与 admin.Handler.Register 对称，便于 main 把两组路由合到同一个 mux：
+// ServeMux 按最具体模式选路，因此 /admin/* 不会被 "/" 兜底吞掉。
+func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", s.handle)
+}
+
+// Handler 返回只含代理路由的处理器（不含管理接口），供测试与嵌入式使用。
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.Register(mux)
 	return mux
 }
 
@@ -145,7 +156,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, matched := s.cfg.Match(model)
+	rule, matched := s.cfg.Current().Match(model)
 	if !matched {
 		// 无规则命中时完全原样放行，由 Cline Pass 自主路由。
 		s.forward(w, r, body, pinHeaders("none", "", "", "no rule matched"))
@@ -231,7 +242,7 @@ func versionSegment(base string) string {
 
 // readBody 读取请求体；失败时已经写好响应，返回 ok=false。
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	limited := http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+	limited := http.MaxBytesReader(w, r.Body, s.cfg.Current().MaxBodyBytes)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -252,7 +263,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, ex
 		w.Header().Set(k, v)
 	}
 
-	target := joinUpstream(s.cfg.Upstream, r.URL.Path)
+	target := joinUpstream(s.cfg.Current().Upstream, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -292,11 +303,12 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, ex
 
 // copyRequestHeaders 只透传白名单内的请求头。
 func (s *Server) copyRequestHeaders(from *http.Request, to *http.Request) {
-	allow := make(map[string]bool, len(baseForwardHeaders)+len(s.cfg.ForwardHeaders))
+	cfg := s.cfg.Current()
+	allow := make(map[string]bool, len(baseForwardHeaders)+len(cfg.ForwardHeaders))
 	for _, h := range baseForwardHeaders {
 		allow[h] = true
 	}
-	for _, h := range s.cfg.ForwardHeaders {
+	for _, h := range cfg.ForwardHeaders {
 		allow[strings.ToLower(strings.TrimSpace(h))] = true
 	}
 
@@ -315,7 +327,7 @@ func (s *Server) copyRequestHeaders(from *http.Request, to *http.Request) {
 	}
 
 	// 配置了固定 key 时覆盖客户端凭据；否则沿用透传过来的 Authorization。
-	if key := strings.TrimSpace(s.cfg.APIKey); key != "" {
+	if key := strings.TrimSpace(cfg.APIKey); key != "" {
 		to.Header.Set("Authorization", "Bearer "+key)
 	}
 }

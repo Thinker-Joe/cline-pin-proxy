@@ -7,9 +7,14 @@
 # 本地配置可能含密钥，绝不入库
 /config.json
 config.local.json
+# docker compose 默认的配置目录
+/data/
 
 # 测试与覆盖率
 coverage.out
+cover.out
+/cover
+/coverage
 *.test
 
 # 编辑器 / 系统

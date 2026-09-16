@@ -50,7 +50,7 @@ func newServer(t *testing.T, upstream string, rules ...config.Rule) *Server {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatalf("normalize config: %v", err)
 	}
-	return New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(config.Static(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func post(t *testing.T, srv *Server, path, body string) *httptest.ResponseRecorder {
@@ -395,7 +395,7 @@ func TestRequestReachesVersionedUpstreamBase(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(config.Static(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rec := post(t, srv, "/v1/chat/completions", `{"model":"cline-pass/deepseek-v4.1-flash"}`)
 
@@ -418,7 +418,7 @@ func TestFixedAPIKeyOverridesClientAuthorization(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(config.Static(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	post(t, srv, "/v1/chat/completions", `{"model":"m"}`)
 
@@ -450,7 +450,7 @@ func TestHeaderForwardingIsWhitelisted(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(config.Static(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -490,7 +490,7 @@ func TestBodyOverLimitIsRejected(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(config.Static(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	big := `{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("x", 500) + `"}]}`
 	rec := post(t, srv, "/v1/chat/completions", big)

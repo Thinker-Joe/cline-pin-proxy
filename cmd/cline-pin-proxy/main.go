@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Thinker-Joe/cline-pin-proxy/internal/admin"
 	"github.com/Thinker-Joe/cline-pin-proxy/internal/config"
 	"github.com/Thinker-Joe/cline-pin-proxy/internal/probe"
 	"github.com/Thinker-Joe/cline-pin-proxy/internal/proxy"
@@ -98,8 +99,21 @@ func usage() {
   CLINE_PIN_FORWARD_HEADERS    额外透传的请求头，逗号分隔
   CLINE_PIN_PROBE_HEADERS      probe 附带的请求头，"name: value" 逗号分隔
   CLINE_PIN_MAX_BODY_BYTES     请求体上限
+  CLINE_PIN_WATCH_SECONDS      配置文件热重载间隔（0 关闭）
+  CLINE_PIN_ADMIN_TOKEN        管理 API 令牌（设置后启用 /admin/*）
+  CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED  未设令牌时也启用管理 API
   CLINE_PIN_RULES              规则表 JSON，覆盖配置文件
   CLINE_PIN_LOG_LEVEL          日志级别 debug|info|warn|error
+
+管理 API（需配置 admin_token，否则返回 404）:
+  GET  /admin/config   查看当前生效配置（密钥不下发）
+  GET  /admin/rules    查看规则
+  PUT  /admin/rules    整体替换规则，立即生效并尽力写回配置文件
+  POST /admin/probe    探测模型可用上游   {"model":"cline-pass/glm-5.3"}
+  POST /admin/reload   强制从文件重载配置
+
+  鉴权：Authorization: Bearer <token> 或 X-Admin-Token: <token>
+  示例：curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/rules
 `)
 }
 
@@ -111,31 +125,63 @@ func runServe(args []string) error {
 		return err
 	}
 
-	cfg, err := config.Load(*configPath)
+	logger := newLogger()
+
+	store, err := config.NewStore(*configPath, logger)
 	if err != nil {
 		return err
 	}
+	cfg := store.Current()
+
+	// listen 只在启动时读一次：进程无法在不中断连接的前提下重新绑定端口，
+	// 因此它不参与热重载（其余配置都可以）。
+	addr := cfg.Listen
 	if v := strings.TrimSpace(*listen); v != "" {
-		cfg.Listen = v
+		addr = v
 	}
 
-	logger := newLogger()
-	srv := proxy.New(cfg, logger)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 热重载：改配置文件即生效，Docker 下无需重建容器。
+	// 这一点很关键——config.json 是挂载文件，compose 察觉不到内容变化。
+	if secs := cfg.WatchSeconds; secs > 0 && store.Path() != "" {
+		go store.Watch(ctx, time.Duration(secs)*time.Second)
+	}
+
+	mux := http.NewServeMux()
+	proxy.New(store, logger).Register(mux)
+
+	adminHandler := admin.NewHandler(store, &configProber{
+		store:  store,
+		client: &http.Client{Timeout: 90 * time.Second},
+	}, logger)
+	adminHandler.Register(mux)
 
 	httpServer := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           srv.Handler(),
+		Addr:              addr,
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		// 刻意不设 WriteTimeout：流式生成可能持续数分钟，会被硬砍断。
 		IdleTimeout: 120 * time.Second,
 	}
 
+	adminState := "disabled"
+	switch {
+	case strings.TrimSpace(cfg.AdminToken) != "":
+		adminState = "enabled (token required)"
+	case cfg.AdminAllowUnauthenticated:
+		adminState = "enabled (no auth)"
+	}
 	logger.Info("cline-pin-proxy starting",
 		"version", version,
-		"listen", cfg.Listen,
+		"listen", addr,
 		"upstream", cfg.Upstream,
 		"rules", len(cfg.Rules),
 		"fixed_api_key", cfg.APIKey != "",
+		"config_file", store.Path(),
+		"watch_seconds", cfg.WatchSeconds,
+		"admin_api", adminState,
 	)
 	for _, r := range cfg.Rules {
 		logger.Info("rule loaded",
@@ -143,9 +189,6 @@ func runServe(args []string) error {
 			"upstreams", strings.Join(r.Upstreams, ">"),
 			"mode", string(r.Mode), "pipeline", string(r.Pipeline))
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -311,6 +354,19 @@ func runCheck(args []string) error {
 		}
 	}
 	return nil
+}
+
+// configProber 用**当前生效**的配置执行探测。
+//
+// 走配置源而不是启动时的快照，这样 probe_headers 之类的改动热重载后
+// 立即对 /admin/probe 生效。
+type configProber struct {
+	store  config.Source
+	client *http.Client
+}
+
+func (p *configProber) Probe(ctx context.Context, model, pipeline string) (probe.Result, error) {
+	return probe.Probe(ctx, p.client, p.store.Current(), model, pipeline)
 }
 
 // multiFlag 允许同一个 flag 重复出现并累积取值。
