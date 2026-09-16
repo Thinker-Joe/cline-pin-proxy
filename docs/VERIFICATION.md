@@ -496,3 +496,107 @@ PUT 裸数组 3 条 → applied=True persisted=True
 启动时静默降级会让人以为规则生效了。**代价**：如果文件被写坏且此刻重启容器，
 容器起不来——这是有意的失败快速，但运维上要知道。
 
+---
+
+## 十二、外部代码审查的处置与复验（2026-09-16）
+
+外部 agent 出具了 [CODE_REVIEW.md](CODE_REVIEW.md)，基线 `5c475b0`，列了
+**18 项问题（3 P1 / 13 P2 / 2 P3）**。逐项处置结果见该文档末尾，这里只记录
+**修复后的真实复验**。
+
+### 1. 编译期才发现的一项：Linux 上 ENOTSUP 与 EOPNOTSUPP 是同一常量
+
+修 P2-16（原子写失败的分类）时写了：
+
+```go
+switch errno {
+case syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EXDEV,
+    syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOSYS:   // Linux：重复 case
+```
+
+Windows 上 `gofmt` / `go vet` / `go test` 全绿，**推到 CI 才炸**：
+
+```
+duplicate case syscall.EOPNOTSUPP (constant 95 of uintptr type syscall.Errno)
+```
+
+这正是本次新增的 `release.yml` 验证门禁的价值——它拦住了这次发布
+（`Build & push image` 与 `Attach binaries` 都处于 `skipped`，没有推 latest）。
+改用 `errors.ErrUnsupported` 表达"不支持"（`syscall.Errno.Is` 已处理这两个别名）。
+
+**据此新增 `scripts/linux-check.sh`**：用 `golang:1.25-alpine` 起容器跑
+`gofmt` + `vet` + `build` + `test -race`。本项目在 Windows 上开发、Linux 上发布，
+凡是碰 errno 常量、文件权限语义、路径分隔符的改动，推之前都要过一遍。
+
+### 2. 真实 Linux 工具链上的验收
+
+```
+go: go version go1.25.14 linux/amd64
+--- gofmt -l . ---   clean
+--- go vet ./... ---   （无输出）
+--- go build ./... --- （无输出）
+--- go test -race ./... ---
+ok  cmd/cline-pin-proxy        ok  internal/admin    ok  internal/config
+ok  internal/pin               ok  internal/probe    ok  internal/proxy
+```
+
+### 3. 生产代理上的行为复验（`170.106.176.16:8787`，镜像 `8270f7f9`）
+
+**编码路径穿越被拒绝**（修复前会穿到上游的 `/admin/...`）：
+
+```
+/v1/%2e%2e/%2e%2e/admin/private   → 404
+/v1/%2e%2e/admin                  → 404
+/api/v1/%2e%2e/%2e%2e/admin       → 404
+/v1/..%2f..%2fadmin               → 404
+```
+
+**`/api/v1` 别名不再被重复拼接**（修复前拼成 `/api/v1/api/v1/models` → 404）：
+
+```
+GET /api/v1/models → 200
+{"object":"list","data":[{"id":"~deepseek/deepseek-pro-latest",...}]}
+```
+
+**其余行为**（用本地 mock 上游 + 临时代理容器，确定性验证 14/15，
+唯一一条 FAIL 是验证脚本自己的期望值写错——该 mock 基址没有版本段，
+不剥离才是正确行为）：
+
+| 场景 | 结果 |
+|---|---|
+| `POST /v1/responses` 1024B（有 Content-Length，上限 64） | **413** |
+| 同上但 `Transfer-Encoding: chunked` | **413** |
+| `POST /v1/responses` 16B（未超限） | **200** |
+| `POST /v1/chat/completions` 超限 | **413** |
+| 上游回 302 | 下游收到 **302** + `Location: /api/v1/models` + **原始正文** |
+| 上游回 `Content-Encoding: gzip` | 编码声明被保留，正文是合法 gzip |
+
+**管理 API**：裸 `null` → **400**、`[null]` → **400**、无认证 → **401**、
+正常读取 → **200**，规则表未被非法请求改动。
+
+**热重载**：改文件加第 4 条规则 → 9 秒生效，容器 PID 全程 `3321511` 未变；
+`PUT` 裸数组复原 3 条 → `applied=true persisted=true`，文件权限 `600`、属主
+`65532:65532` 均保留。
+
+### 4. 全链路复验（sub2api → 本代理 → Cline Pass）
+
+| 账号 | 模型 | 结果 |
+|---|---|---|
+| 268 | `cline-pass/glm-5.3` | ✅ `success=True content='ok'` |
+| 268 | `cline-pass/glm-5.3-flash` | ✅ |
+| 268 | `cline-pass/deepseek-v4.1-flash` | ✅ |
+| 301 | `cline-pass/glm-5.3-flash` | ✅ |
+| 301 | `cline-pass/deepseek-v4.1-flash` | ✅ |
+
+**5/5 通过。** 代理侧同期日志 19 条 `pinned request`，分布
+`11×deepseek-v4.1-flash→deepseek`、`6×glm-5.3→friendli`、`2×glm-5.3-flash→relace`，
+**未命中规则 0 条、注入失败 0 条**。
+
+### 5. 一处修正
+
+复验脚本最初把 **admin token** 当成 Cline Pass key 发给了 `/v1/chat/completions`
+（生产代理是透传模式，`CLINE_PIN_API_KEY` 为空），拿到 401。
+**这是验证脚本的错误，不是代理的**：响应头里的 `X-Cline-Pin-Rule: glm-5.3`
+恰恰证明代理的规则匹配与注入都正常，只是上游拒绝了那个凭据。
+真实补全改用 sub2api 的账号测试接口，它从账号配置里取真实 key。
+
