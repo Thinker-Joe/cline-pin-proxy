@@ -77,28 +77,24 @@ func Inject(body []byte, opts Options) ([]byte, error) {
 
 	writePlanner, writeDirect := pipelines(opts.Pipeline)
 
+	// 直接在被注入的那层对象上改，而不是先造一个临时 map 再合并：
+	// 代理必须能**删掉**自己管辖字段里的旧值（见 applyChoice）。
 	if writePlanner {
-		gw := map[string]any{}
+		gw := nestedMap(root, "providerOptions", "gateway")
 		applyChoice(gw, ups, preferred)
 		if sort != "" {
 			gw["sort"] = sort
 		}
-		if len(gw) > 0 {
-			mergeInto(nestedMap(root, "providerOptions", "gateway"), gw)
-		}
 	}
 
 	if writeDirect {
-		p := map[string]any{}
+		p := nestedMap(root, "provider")
 		applyChoice(p, ups, preferred)
 		if sort != "" {
 			if mapped, ok := openRouterSort[sort]; ok {
 				sort = mapped
 			}
 			p["sort"] = sort
-		}
-		if len(p) > 0 {
-			mergeInto(nestedMap(root, "provider"), p)
 		}
 	}
 
@@ -126,18 +122,27 @@ func pipelines(p config.Pipeline) (planner, direct bool) {
 	}
 }
 
-// applyChoice 按钉死强度写入 only 或 order。
+// applyChoice 按钉死强度写入 only 或 order，并清掉互斥的旧值。
 //
 // strict   → only: [上游]         网关没有其他候选，等价于禁止回退
 // preferred→ order: [上游, ...]   按序尝试，失败才回退
+//
+// 为什么必须删：这两组字段是**互斥**的，代理才是决定路由的一方（规则由
+// 部署者配置，不是调用方）。若调用方自己发了 only，只追加 order 是无效的
+// ——新候选根本不在 only 的允许集合里，配置的回退顺序形同虚设；
+// 反过来 preferred 遇到调用方的 allow_fallbacks=false 也会被禁掉回退，
+// 多候选悄悄退化成"只用第一个"。这类静默失效正是本项目最想避免的。
 func applyChoice(dst map[string]any, upstreams []string, preferred bool) {
 	if len(upstreams) == 0 {
 		return
 	}
 	if preferred {
+		delete(dst, "only")
+		delete(dst, "allow_fallbacks")
 		dst["order"] = toAnySlice(upstreams)
 		return
 	}
+	delete(dst, "order")
 	dst["only"] = []any{upstreams[0]}
 }
 

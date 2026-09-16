@@ -24,12 +24,16 @@ services:
       - "127.0.0.1:8787:8787"
 
     environment:
-      CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-https://api.cline.bot/api/v1}
+      # 刻意都用 `:-`（空默认）：compose 只要写了 `VAR: ${VAR:-默认值}`，
+      # 即使宿主没设也会往容器里注入那个默认值，而本项目是**环境变量优先于
+      # 配置文件**——那样 data/config.json 里的 upstream / forward_headers
+      # 就永远被遮蔽，热重载也救不回来。留空则退回应用内置默认值。
+      CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-}
       # 固定上游密钥。留空则透传调用方传来的 Authorization。
       CLINE_PIN_API_KEY: ${CLINE_PIN_API_KEY:-}
+      CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-}
+      # 日志级别不是配置字段，给个默认值没有副作用。
       CLINE_PIN_LOG_LEVEL: ${CLINE_PIN_LOG_LEVEL:-info}
-      # Cline 网关会看这个头；调用方（如 sub2api 的 header_override）常配它。
-      CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-x-client-type}
 
     # 配置走整个目录而不是单个文件：文件不存在时 compose 会把 bind 源建成
     # **目录**，那是很难排查的坑；挂目录则天然安全，且 config.json 缺失时

@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -87,9 +88,20 @@ func New(cfg config.Source, log *slog.Logger) *Server {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Server{
-		cfg:    cfg,
-		client: &http.Client{Transport: transport},
-		log:    log,
+		cfg: cfg,
+		client: &http.Client{
+			Transport: transport,
+			// 绝不替调用方跟随重定向。
+			//
+			// 默认行为会把 302 跟掉：POST 被改成 GET、原始状态码与响应体丢失、
+			// 调用方看到一个来自别处的 200。这既违反"上游状态码与响应体原样
+			// 回传"的约定，也让上游有机会把代理引到别处。
+			// ErrUseLastResponse 让 30x 连同 Location 原样返回给客户端。
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		log: log,
 	}
 }
 
@@ -122,16 +134,58 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == http.MethodPost && chatCompletionsPaths[r.URL.Path] {
-		s.handleChatCompletions(w, r)
-		return
-	}
+	// 一次请求只取一份配置快照。
+	//
+	// 逐个字段调 Current() 会在热重载正好插进中间时把请求发往旧上游、
+	// 却带上新配置的密钥。原子指针只保证单次读取安全，不保证整条链一致。
+	cfg := s.cfg.Current()
 
-	if !isPassthroughPath(r.URL.Path) {
+	path, ok := safeRoutePath(r.URL)
+	if !ok {
 		s.writeError(w, http.StatusNotFound, "no route: "+r.Method+" "+r.URL.Path)
 		return
 	}
-	s.forward(w, r, nil, nil)
+
+	if r.Method == http.MethodPost && chatCompletionsPaths[path] {
+		s.handleChatCompletions(w, r, cfg, path)
+		return
+	}
+
+	if !isPassthroughPath(path) {
+		s.writeError(w, http.StatusNotFound, "no route: "+r.Method+" "+r.URL.Path)
+		return
+	}
+	s.forward(w, r, cfg, path, nil, nil)
+}
+
+// safeRoutePath 返回可用于路由判断与上游拼接的路径，不安全时返回 false。
+//
+// 必须拒绝两类输入：
+//
+//   - **百分号转义**。Go 1.22+ 的 ServeMux 用 EscapedPath() 做匹配与 cleanPath，
+//     字面量 "%2e%2e" 不是 path.Clean 眼里的 ".."，既不会被规范化也不会触发
+//     301 重定向；而处理器里读到的 r.URL.Path **已经解码**成 "../../"，拿去
+//     joinUpstream 拼出来的地址，在上游一规范化就跳出了 API 前缀。
+//   - **点段**。即使不做转义，".." 也能在会规范化路径的上游上跳出前缀。
+//
+// 本项目支持的 OpenAI 端点路径不含需要转义的字符，因此直接拒绝比猜测更安全。
+func safeRoutePath(u *url.URL) (string, bool) {
+	if u.RawPath != "" {
+		return "", false
+	}
+	path := u.Path
+	if path == "" {
+		return "/", true
+	}
+	if strings.ContainsAny(path, "%\\\x00") {
+		return "", false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
+			return "", false
+		}
+	}
+	return path, true
 }
 
 func isPassthroughPath(path string) bool {
@@ -143,8 +197,8 @@ func isPassthroughPath(path string) bool {
 	return false
 }
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.readBody(w, r)
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, cfg *config.Config, path string) {
+	body, ok := s.readBody(w, r, cfg)
 	if !ok {
 		return
 	}
@@ -152,14 +206,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	model, err := pin.ModelOf(body)
 	if err != nil {
 		s.log.Warn("model field unreadable, passing through unpinned", "error", err)
-		s.forward(w, r, body, pinHeaders("none", "", "", "model field unreadable"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "model field unreadable"))
 		return
 	}
 
-	rule, matched := s.cfg.Current().Match(model)
+	rule, matched := cfg.Match(model)
 	if !matched {
 		// 无规则命中时完全原样放行，由 Cline Pass 自主路由。
-		s.forward(w, r, body, pinHeaders("none", "", "", "no rule matched"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "no rule matched"))
 		return
 	}
 
@@ -173,7 +227,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 注入失败时降级为未钉死透传，并在响应头里明确标注，避免"以为钉住了"。
 		s.log.Warn("injection failed, passing through unpinned",
 			"model", model, "rule", rule.Name, "error", err)
-		s.forward(w, r, body, pinHeaders("none", "", "", "injection failed"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "injection failed"))
 		return
 	}
 
@@ -186,7 +240,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"pipeline", string(rule.Pipeline),
 	)
 
-	s.forward(w, r, injected, pinHeaders(rule.Name, joined, string(rule.Mode), ""))
+	s.forward(w, r, cfg, path, injected, pinHeaders(rule.Name, joined, string(rule.Mode), ""))
 }
 
 // pinHeaders 组装用于观测的响应头。note 非空表示这次没有真正钉死。
@@ -206,18 +260,36 @@ func pinHeaders(rule, upstreams, mode, note string) map[string]string {
 
 // joinUpstream 把客户端路径拼到上游基址上，并消掉重复的版本段。
 //
-// 调用方的 base_url 有两种常见写法，而请求路径都会是 /v1/...：
+// 调用方的 base_url 有多种常见写法，而请求路径可能带也可能不带版本段：
 //
-//	http://proxy:8787     客户端自己拼 -> /v1/chat/completions
-//	http://proxy:8787/v1  客户端拼端点 -> /v1/chat/completions（同样带 /v1）
+//	http://proxy:8787           客户端拼 -> /v1/chat/completions
+//	http://proxy:8787/v1        客户端拼端点 -> /v1/chat/completions
+//	http://proxy:8787/api/v1    某些客户端习惯 -> /api/v1/chat/completions
 //
 // 而上游基址 https://api.cline.bot/api/v1 末尾**已经**含有版本段。
-// 若直接相加会得到 /api/v1/v1/chat/completions，上游一律回 404——
-// 这是本项目早期版本的真实故障，单测用假上游接任意路径，所以漏掉了。
+// 只剥离 "/v1" 不够：/api/v1/chat/completions 会被拼成
+// /api/v1/api/v1/chat/completions，上游一律 404——README 与
+// chatCompletionsPaths 都声明支持这个别名，因此必须一并处理。
 func joinUpstream(base, path string) string {
 	base = strings.TrimRight(base, "/")
-	if seg := versionSegment(base); seg != "" && strings.HasPrefix(path, "/"+seg+"/") {
-		path = strings.TrimPrefix(path, "/"+seg)
+	if seg := versionSegment(base); seg != "" {
+		// 从具体到宽泛：先试 /api/v1，再试 /v1。
+		for _, prefix := range []string{"/api/" + seg, "/" + seg} {
+			if path == prefix {
+				path = "/"
+				break
+			}
+			if strings.HasPrefix(path, prefix+"/") {
+				path = strings.TrimPrefix(path, prefix)
+				break
+			}
+		}
+	}
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
 	return base + path
 }
@@ -241,8 +313,8 @@ func versionSegment(base string) string {
 }
 
 // readBody 读取请求体；失败时已经写好响应，返回 ok=false。
-func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	limited := http.MaxBytesReader(w, r.Body, s.cfg.Current().MaxBodyBytes)
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request, cfg *config.Config) ([]byte, bool) {
+	limited := http.MaxBytesReader(w, r.Body, cfg.MaxBodyBytes)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -258,19 +330,30 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool)
 
 // forward 把请求转发到上游并把响应原样回传。
 // body 为 nil 时直接流式转发原始请求体（用于纯净透传路径）。
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, extraHeaders map[string]string) {
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, cfg *config.Config, path string, body []byte, extraHeaders map[string]string) {
 	for k, v := range extraHeaders {
 		w.Header().Set(k, v)
 	}
 
-	target := joinUpstream(s.cfg.Current().Upstream, r.URL.Path)
+	target := joinUpstream(cfg.Upstream, path)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 
-	var reader io.Reader = r.Body
+	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
+	} else {
+		// 体积上限是进程级约定，透传端点同样要执行。
+		// 已知长度时直接拒；未知长度（chunked）时靠 MaxBytesReader 在读取中拦截。
+		if cfg.MaxBodyBytes > 0 && r.ContentLength > cfg.MaxBodyBytes {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds configured limit")
+			return
+		}
+		reader = r.Body
+		if cfg.MaxBodyBytes > 0 {
+			reader = http.MaxBytesReader(w, r.Body, cfg.MaxBodyBytes)
+		}
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, reader)
@@ -278,13 +361,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, ex
 		s.writeError(w, http.StatusBadGateway, "cannot build upstream request")
 		return
 	}
-	s.copyRequestHeaders(r, req)
+	s.copyRequestHeaders(r, req, cfg)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// 客户端主动断开：请求上下文已取消，上游请求也随之终止。不是错误。
-			s.log.Debug("client canceled request", "path", r.URL.Path)
+			s.log.Debug("client canceled request", "path", path)
+			return
+		}
+		// 超限是在传输层读 body 时才发现的，这里映射回 413。
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds configured limit")
 			return
 		}
 		s.log.Error("upstream request failed", "target", target, "error", err)
@@ -296,14 +385,24 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, body []byte, ex
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	if err := flushCopy(w, resp.Body); err != nil && r.Context().Err() == nil {
-		s.log.Debug("response stream ended early", "error", err)
+	if err := flushCopy(w, resp.Body); err != nil {
+		if r.Context().Err() != nil {
+			return // 客户端主动断开，正常收场
+		}
+		// 响应头已经写出去了，没法再改成 5xx。但如果就这么返回，下游会把
+		// 被截断的内容当成"正常结束"——因为 Content-Length 不透传，HTTP 层
+		// 没有任何失败信号，SSE 客户端可能一直等下去或把半句话当完整回答。
+		//
+		// http.ErrAbortHandler 会让 net/http 直接断开连接（并抑制堆栈噪音），
+		// 客户端因此拿到 unexpected EOF，而不是一份"成功"的残缺响应。
+		s.log.Warn("upstream response ended prematurely, aborting downstream connection",
+			"target", target, "error", err)
+		panic(http.ErrAbortHandler)
 	}
 }
 
 // copyRequestHeaders 只透传白名单内的请求头。
-func (s *Server) copyRequestHeaders(from *http.Request, to *http.Request) {
-	cfg := s.cfg.Current()
+func (s *Server) copyRequestHeaders(from, to *http.Request, cfg *config.Config) {
 	allow := make(map[string]bool, len(baseForwardHeaders)+len(cfg.ForwardHeaders))
 	for _, h := range baseForwardHeaders {
 		allow[h] = true
@@ -337,13 +436,24 @@ func (s *Server) copyRequestHeaders(from *http.Request, to *http.Request) {
 // 采用白名单而非黑名单：既避开逐跳头，也刻意不转发 content-length——
 // 注入会改变请求体长度，响应长度也可能因解压而变，交给 Go 自行计算更安全。
 // x-* 全量放行，这样调用方能读到上游的路由元数据头。
+//
+// content-encoding 必须放行：调用方若显式带了 accept-encoding，Go 的
+// Transport 不会替它解压，压缩正文就靠这个头才能被正确解读。
+// location 同样必须放行，否则下游收到一个没有目标地址的重定向。
 func copyResponseHeaders(dst, src http.Header) {
+	pass := map[string]bool{
+		"content-type":     true,
+		"content-encoding": true,
+		"cache-control":    true,
+		"retry-after":      true,
+		"location":         true,
+	}
 	for name, values := range src {
 		lower := strings.ToLower(name)
 		if hopByHopHeaders[lower] {
 			continue
 		}
-		if lower != "content-type" && lower != "cache-control" && lower != "retry-after" && !strings.HasPrefix(lower, "x-") {
+		if !pass[lower] && !strings.HasPrefix(lower, "x-") {
 			continue
 		}
 		for _, v := range values {

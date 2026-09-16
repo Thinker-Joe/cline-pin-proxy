@@ -6,7 +6,9 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -185,13 +187,14 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config %s: %w", path, err)
 		}
-		// 从默认值出发整体覆盖，让配置文件只需写关心到的字段。
-		if err := json.Unmarshal(raw, cfg); err != nil {
+		if err := applyFile(cfg, raw); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
 		}
 	}
 
-	applyEnv(cfg)
+	if err := applyEnv(cfg); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.Normalize(); err != nil {
 		return nil, err
@@ -199,8 +202,78 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// applyFile 把配置文件里**出现过的**字段覆盖到 cfg 上，其余保持默认值。
+//
+// 刻意不写成 json.Unmarshal(raw, cfg)：Go 解码 slice 时会复用既有元素，
+// 于是 {"rules":[{"model":"x"}]} 里没写的 Name/Upstreams 会继承**同位置默认
+// 规则**的值，把自定义模型悄悄发去默认渠道。这里每个字段都解码到独立的新值，
+// rules 更是整体替换，不会与默认表混在一起。
+func applyFile(cfg *Config, raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	// 顶层 null 会得到 nil map：它既不是"空配置"也不是"没写字段"，
+	// 直接拒绝，免得被当成合法配置放行。
+	if fields == nil {
+		return errors.New("config must be a JSON object")
+	}
+
+	// 逐字段解码到零值再赋值：字符串/数字/布尔直接覆盖，切片与 map 整体替换。
+	scalars := []struct {
+		key string
+		dst any
+	}{
+		{"listen", &cfg.Listen},
+		{"upstream", &cfg.Upstream},
+		{"api_key", &cfg.APIKey},
+		{"admin_token", &cfg.AdminToken},
+		{"admin_allow_unauthenticated", &cfg.AdminAllowUnauthenticated},
+		{"max_body_bytes", &cfg.MaxBodyBytes},
+		{"watch_seconds", &cfg.WatchSeconds},
+	}
+	for _, f := range scalars {
+		raw, ok := fields[f.key]
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal(raw, f.dst); err != nil {
+			return fmt.Errorf("field %q: %w", f.key, err)
+		}
+	}
+
+	if raw, ok := fields["forward_headers"]; ok {
+		var v []string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return fmt.Errorf("field %q: %w", "forward_headers", err)
+		}
+		cfg.ForwardHeaders = v
+	}
+	if raw, ok := fields["probe_headers"]; ok {
+		var v map[string]string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return fmt.Errorf("field %q: %w", "probe_headers", err)
+		}
+		cfg.ProbeHeaders = v
+	}
+	if raw, ok := fields["rules"]; ok {
+		var rules []Rule
+		if err := json.Unmarshal(raw, &rules); err != nil {
+			return fmt.Errorf("field %q: %w", "rules", err)
+		}
+		if rules == nil {
+			return errors.New(`field "rules" must be an array (use [] to disable pinning)`)
+		}
+		cfg.Rules = rules
+	}
+	return nil
+}
+
 // applyEnv 应用环境变量覆盖。环境变量优先级高于配置文件。
-func applyEnv(cfg *Config) {
+//
+// 显式给出但内容非法时**返回错误**而不是静默忽略：把 `CLINE_PIN_RULES='[{bad'`
+// 当成"没配置"，会让运维者以为规则表已被覆盖，实际继续走默认渠道。
+func applyEnv(cfg *Config) error {
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_LISTEN")); v != "" {
 		cfg.Listen = v
 	}
@@ -211,22 +284,28 @@ func applyEnv(cfg *Config) {
 		cfg.APIKey = v
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_MAX_BODY_BYTES")); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			cfg.MaxBodyBytes = n
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("CLINE_PIN_MAX_BODY_BYTES must be a positive integer, got %q", v)
 		}
+		cfg.MaxBodyBytes = n
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_WATCH_SECONDS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			cfg.WatchSeconds = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return fmt.Errorf("CLINE_PIN_WATCH_SECONDS must be a non-negative integer, got %q", v)
 		}
+		cfg.WatchSeconds = n
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_ADMIN_TOKEN")); v != "" {
 		cfg.AdminToken = v
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED")); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.AdminAllowUnauthenticated = b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED must be a boolean, got %q", v)
 		}
+		cfg.AdminAllowUnauthenticated = b
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_FORWARD_HEADERS")); v != "" {
 		cfg.ForwardHeaders = splitList(v)
@@ -236,10 +315,15 @@ func applyEnv(cfg *Config) {
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_RULES")); v != "" {
 		var rules []Rule
-		if err := json.Unmarshal([]byte(v), &rules); err == nil {
-			cfg.Rules = rules
+		if err := json.Unmarshal([]byte(v), &rules); err != nil {
+			return fmt.Errorf("CLINE_PIN_RULES is not a valid JSON rule array: %w", err)
 		}
+		if rules == nil {
+			return errors.New(`CLINE_PIN_RULES must be a JSON array (use [] to disable pinning)`)
+		}
+		cfg.Rules = rules
 	}
+	return nil
 }
 
 func splitList(s string) []string {
@@ -282,8 +366,8 @@ func (c *Config) Normalize() error {
 	if c.Upstream == "" {
 		c.Upstream = DefaultUpstream
 	}
-	if !strings.HasPrefix(c.Upstream, "http://") && !strings.HasPrefix(c.Upstream, "https://") {
-		return fmt.Errorf("upstream must start with http:// or https://, got %q", c.Upstream)
+	if err := validateUpstream(c.Upstream); err != nil {
+		return err
 	}
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = DefaultMaxBodyBytes
@@ -325,6 +409,28 @@ func (c *Config) Normalize() error {
 		if err := c.Rules[i].Normalize(i); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateUpstream 校验基址真的可以被 url 解析并用于路径拼接。
+//
+// 只看 "http://" 前缀不够：`http://%` 要通过真实请求才炸，而带 query 的
+// `http://host?x=1` 会被后续的字符串拼接毁掉（端点被追加进 query）。
+func validateUpstream(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("upstream is not a valid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("upstream scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("upstream must include a host, got %q", raw)
+	}
+	// query / fragment 会与"追加端点路径"的拼接方式冲突，userinfo 允许保留。
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("upstream must not contain a query or fragment, got %q", raw)
 	}
 	return nil
 }

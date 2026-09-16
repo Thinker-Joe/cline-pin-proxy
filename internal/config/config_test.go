@@ -351,13 +351,42 @@ func TestEnvOverrides(t *testing.T) {
 	}
 }
 
-func TestEnvIgnoresInvalidValues(t *testing.T) {
-	t.Setenv("CLINE_PIN_MAX_BODY_BYTES", "not-a-number")
+// 显式给出但非法的环境变量必须让加载失败，而不是静默忽略。
+//
+// 静默忽略会让运维者以为覆盖生效了：写错一个数字仍然用默认值跑，
+// 写错规则表仍然走默认的第三方渠道——都属于"以为配置了，其实没有"。
+func TestEnvRejectsInvalidValues(t *testing.T) {
+	for name, kv := range map[string][2]string{
+		"CLINE_PIN_MAX_BODY_BYTES":              {"not-a-number", "MaxBodyBytes"},
+		"CLINE_PIN_MAX_BODY_BYTES (negative)":   {"-1", "MaxBodyBytes"},
+		"CLINE_PIN_WATCH_SECONDS":               {"soon", "WatchSeconds"},
+		"CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED": {"maybe", "AdminAllowUnauthenticated"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			key := name
+			if i := strings.Index(key, " "); i > 0 {
+				key = key[:i]
+			}
+			t.Setenv(key, kv[0])
+			if _, err := Load(""); err == nil {
+				t.Errorf("%s=%q 应让加载失败", key, kv[0])
+			}
+		})
+	}
+}
+
+// 空值仍然等同于"没配置"，不参与覆盖。
+func TestEnvIgnoresEmptyValues(t *testing.T) {
+	t.Setenv("CLINE_PIN_MAX_BODY_BYTES", "")
+	t.Setenv("CLINE_PIN_UPSTREAM", "   ")
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.MaxBodyBytes != DefaultMaxBodyBytes {
-		t.Errorf("invalid env value should be ignored, got %d", cfg.MaxBodyBytes)
+		t.Errorf("MaxBodyBytes = %d, want default", cfg.MaxBodyBytes)
+	}
+	if cfg.Upstream != DefaultUpstream {
+		t.Errorf("Upstream = %q, want default", cfg.Upstream)
 	}
 }

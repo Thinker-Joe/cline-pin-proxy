@@ -396,15 +396,21 @@ func TestWriteInPlaceOverwritesFile(t *testing.T) {
 	}
 }
 
-// 目录不存在时两条写回路径都走不通，必须把两个错误都报出来，
-// 而不是只报原子替换那个（否则用户看不出真正原因）。
-func TestSetRulesReportsBothPersistFailures(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "no-such-dir", "config.json")
-	s, err := NewStore(filepath.Join(t.TempDir(), "seed.json"), nil)
+// 两条写回路径都走不通时必须报错，且**不能**破坏原文件。
+//
+// 注意目录不存在属于"这不是权限问题"，按新的失败分类不会退化为原地覆盖：
+// 原地写同样会失败，而且会先把唯一的好文件截断。
+func TestSetRulesReportsPersistFailureWithoutTouchingFile(t *testing.T) {
+	dir := t.TempDir()
+	original := `{"rules":[{"name":"a","model":"m","upstreams":["x"]}]}`
+	good := filepath.Join(dir, "config.json")
+	writeFile(t, good, original)
+
+	s, err := NewStore(good, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.path = path // 指向不可写的路径：要的就是「两条写回路径都失败」这个状态
+	s.path = filepath.Join(dir, "no-such-dir", "config.json") // 指向不可写的路径
 
 	persisted, persistErr, err := s.SetRules([]Rule{{Name: "n", Model: "m", Upstreams: []string{"a"}}})
 	if err != nil {
@@ -413,11 +419,15 @@ func TestSetRulesReportsBothPersistFailures(t *testing.T) {
 	if persisted || persistErr == nil {
 		t.Fatalf("persisted=%v persistErr=%v, want false/<error>", persisted, persistErr)
 	}
-	if !strings.Contains(persistErr.Error(), "in-place fallback also failed") {
-		t.Errorf("error should mention both attempts, got: %v", persistErr)
-	}
 	if s.Current().Rules[0].Name != "n" {
 		t.Error("rules should still apply in memory when persist fails")
+	}
+	raw, readErr := os.ReadFile(good)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(raw) != original {
+		t.Errorf("原文件被改动:\n%s", raw)
 	}
 }
 

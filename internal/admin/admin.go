@@ -231,32 +231,54 @@ func (h *Handler) handleReload(w http.ResponseWriter, r *http.Request) {
 //
 // 两种都收：只认其中一种的话，调用方要先吃一个 400 才知道该用哪种，
 // 而实测中这确实发生了（README 写裸数组、实现只认包装形式）。
+//
+// 但 null 一律拒绝：裸 `null` 会解码成 nil slice 并被当成"清空规则表"接受，
+// 一个把未初始化变量直接序列化的脚本就能关掉全部钉死规则。清空只能显式写 []。
 func decodeRules(r *http.Request) ([]config.Rule, error) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxAdminBodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read request body: %w", err)
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		return nil, errors.New("empty request body")
 	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil, errors.New(`invalid JSON body: rules must be an array (use [] to clear all rules)`)
+	}
 
-	body := raw
-	if trimmed := bytes.TrimSpace(raw); trimmed[0] == '{' {
+	if trimmed[0] == '{' {
 		var wrapper struct {
-			Rules []config.Rule `json:"rules"`
+			Rules []json.RawMessage `json:"rules"`
 		}
 		if err := unmarshalStrict(trimmed, &wrapper); err != nil {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
 		if wrapper.Rules == nil {
-			return nil, errors.New(`invalid JSON body: object form requires a "rules" array`)
+			return nil, errors.New(`invalid JSON body: object form requires a "rules" array (use [] to clear all rules)`)
 		}
-		return wrapper.Rules, nil
+		return decodeRuleElements(wrapper.Rules)
 	}
 
-	var rules []config.Rule
-	if err := unmarshalStrict(body, &rules); err != nil {
+	var elements []json.RawMessage
+	if err := unmarshalStrict(trimmed, &elements); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return decodeRuleElements(elements)
+}
+
+// decodeRuleElements 逐个解码规则，并拒绝 null 元素。
+func decodeRuleElements(elements []json.RawMessage) ([]config.Rule, error) {
+	rules := make([]config.Rule, 0, len(elements))
+	for i, raw := range elements {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return nil, fmt.Errorf("invalid JSON body: rules[%d] must be an object, got null", i)
+		}
+		var rule config.Rule
+		if err := unmarshalStrict(raw, &rule); err != nil {
+			return nil, fmt.Errorf("invalid JSON body: rules[%d]: %w", i, err)
+		}
+		rules = append(rules, rule)
 	}
 	return rules, nil
 }

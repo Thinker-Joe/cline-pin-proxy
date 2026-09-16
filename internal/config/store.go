@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -163,8 +164,14 @@ func (s *Store) SetRules(rules []Rule) (persisted bool, persistErr error, err er
 	if err := s.persistRulesLocked(normalized); err != nil {
 		return false, err, nil
 	}
-	if info, statErr := os.Stat(s.path); statErr == nil {
-		s.modTime = info.ModTime()
+
+	// 落盘读的是**磁盘上的最新文件**，而内存快照可能落后于它（外部刚改过、
+	// 热重载还没轮到）。此时若把 mtime 标记为"已处理"，那份外部修改就永远
+	// 进不了内存：磁盘是新值、内存是旧值。所以写完立刻强制重读一次，
+	// 让内存与磁盘对齐，顺便带上刚写进去的新规则。
+	if _, reloadErr := s.reloadLocked(true); reloadErr != nil {
+		s.log.Warn("config persisted but reload failed; in-memory rules kept",
+			"path", s.path, "error", reloadErr)
 	}
 	return true, nil, nil
 }
@@ -173,20 +180,32 @@ func (s *Store) SetRules(rules []Rule) (persisted bool, persistErr error, err er
 //
 // 刻意不做「把生效配置整体写回」：那样会把环境变量的覆盖值（例如
 // CLINE_PIN_API_KEY）烤进文件，属于意料之外的副作用。
+//
+// 用 map[string]json.RawMessage 而不是 map[string]any：后者会把所有数字落到
+// float64，改写无关字段里的大整数（2^53+1 会变成 2^53）。
 func (s *Store) persistRulesLocked(rules []Rule) error {
-	doc := map[string]any{}
+	doc := map[string]json.RawMessage{}
 	raw, err := os.ReadFile(s.path)
 	switch {
 	case err == nil:
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return fmt.Errorf("config must be a JSON object to persist rules: %w", err)
 		}
+		if doc == nil {
+			// 顶层是 null：不是对象，写回会 panic 到 nil map 上。
+			return errors.New("config must be a JSON object to persist rules, got null")
+		}
 	case errors.Is(err, os.ErrNotExist):
 		// 首次写回：文件还不存在，就创建一个只含 rules 的配置。
 	default:
 		return fmt.Errorf("read config for persist: %w", err)
 	}
-	doc["rules"] = rules
+
+	encoded, err := json.Marshal(rules)
+	if err != nil {
+		return fmt.Errorf("encode rules: %w", err)
+	}
+	doc["rules"] = encoded
 
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -195,20 +214,46 @@ func (s *Store) persistRulesLocked(rules []Rule) error {
 	out = append(out, '\n')
 
 	// 首选原子替换：同目录临时文件 + rename，避免写到一半留下坏配置。
-	if _, renameErr := s.writeAtomic(out); renameErr == nil {
+	if _, atomicErr := s.writeAtomic(out); atomicErr == nil {
 		return nil
+	} else if !isAtomicReplaceUnavailable(atomicErr) {
+		// 退路只在"原子替换确实做不到"时启用（目录不可写、只读挂载等）。
+		//
+		// 必须区分失败原因：临时文件的 Write/Sync 失败（磁盘满、I/O 错误）说明
+		// 内容根本写不出去，此时再 O_TRUNC 原地覆盖，会把唯一完好的配置文件
+		// 也截断——既没落盘成功，又毁掉了重建的依据。
+		return fmt.Errorf("write config: %w", atomicErr)
+	} else if inPlaceErr := s.writeInPlace(out); inPlaceErr != nil {
+		return fmt.Errorf("replace config: %w (in-place fallback also failed: %v)", atomicErr, inPlaceErr)
 	} else {
-		// 退路：Docker 单文件 bind mount 下，容器内目录属于 root 而进程是
-		// nonroot，rename 会失败（它需要**目录**可写），但只要文件本身可写就
-		// 能原地覆盖。原地写不满足原子性，所以仅在原子路径确实走不通时使用。
-		if inPlaceErr := s.writeInPlace(out); inPlaceErr == nil {
-			s.log.Warn("config persisted in place (atomic replace unavailable)",
-				"path", s.path, "atomic_error", renameErr.Error())
-			return nil
-		} else {
-			return fmt.Errorf("replace config: %w (in-place fallback also failed: %v)", renameErr, inPlaceErr)
-		}
+		// Docker 单文件 bind mount 下，容器内目录属于 root 而进程是 nonroot，
+		// rename 需要**目录**可写因而失败，但只要文件本身可写就能原地覆盖。
+		// 原地写不保证原子性，是明确的取舍。
+		s.log.Warn("config persisted in place (atomic replace unavailable)",
+			"path", s.path, "atomic_error", atomicErr.Error())
+		return nil
 	}
+}
+
+// isAtomicReplaceUnavailable 判断原子替换是不是"这个目录做不到"，
+// 而不是"这次内容没写成功"。
+//
+// 只有前者才允许退化为原地覆盖：原地写不具备原子性（写到一半断电会留下
+// 半个文件），是明确的取舍，不能因为任何一次写失败就启用。
+func isAtomicReplaceUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EXDEV,
+			syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOSYS:
+			return true
+		}
+		return false
+	}
+	return errors.Is(err, os.ErrPermission)
 }
 
 // writeAtomic 用同目录临时文件 + rename 原子替换配置，返回临时文件名。

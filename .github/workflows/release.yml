@@ -16,11 +16,58 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 发布前的验证门禁。
+  #
+  # CI 与 Release 是两个独立的 push 工作流，Release 原先没有任何测试步骤、
+  # 也不依赖 CI：main 上只要编译得过，即使单测/vet/gofmt 失败也会推 latest；
+  # 而 CI 的 push 触发器只匹配 main，tag 推送连 CI 都不会跑。
+  # 所以门禁必须建在这里，并且让 docker / binaries 都 needs 它。
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -eu
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race ./...
+
+      - name: go.mod is tidy
+        run: |
+          set -eu
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "go.mod / go.sum 未同步，请本地执行 go mod tidy 后提交"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
   # 构建多架构镜像并推送到 GHCR
   # ---------------------------------------------------------------------------
   docker:
     name: Build & push image
     runs-on: ubuntu-latest
+    needs: verify
     steps:
       - name: Checkout
         uses: actions/checkout@v4

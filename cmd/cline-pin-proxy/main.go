@@ -55,15 +55,16 @@ func run(args []string) error {
 		sub, args = args[0], args[1:]
 	}
 
+	var err error
 	switch sub {
 	case "serve":
-		return runServe(args)
+		err = runServe(args)
 	case "probe":
-		return runProbe(args)
+		err = runProbe(args)
 	case "check":
-		return runCheck(args)
+		err = runCheck(args)
 	case "healthcheck":
-		return runHealthcheck(args)
+		err = runHealthcheck(args)
 	case "version":
 		fmt.Println("cline-pin-proxy", version)
 		return nil
@@ -73,6 +74,13 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown subcommand %q (want serve|probe|check|version)", sub)
 	}
+
+	// `cline-pin-proxy -h` 会被当成 serve 的 flag，flag 包打完用法后返回
+	// ErrHelp。那是一次正常的求助手势，不该以非零码退出。
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
+	return err
 }
 
 func usage() {
