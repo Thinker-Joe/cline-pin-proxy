@@ -25,9 +25,10 @@ func TestDefaultIsValid(t *testing.T) {
 
 // 默认规则必须把每个模型送到**实测确认过的**上游 slug。
 //
-// 这里锁死的是 2026-09-16 真实探测的结果：glm-5.3-flash 的上游叫 z-ai，
-// 而 glm-5.3 的上游叫 zai。早期版本用一条泛化的 `glm` → z-ai 规则，
-// 把 glm-5.3 打成了 400，所以顺序与 slug 都是承重的，不能随手动。
+// 这里锁死的是 2026-09-16 逐模型探测 + 逐个测速的结果：
+// GLM 刻意不钉官方（官方 TTFT 2.0–3.1s / 1.8–2.2s，比选中的第三方慢 3–6 倍）。
+// 顺序与 slug 都是承重的，不能随手动：早期版本用一条泛化的 `glm` → `z-ai`
+// 规则把 glm-5.3 打成了 400。
 func TestDefaultRulesRouteEveryModelToVerifiedSlug(t *testing.T) {
 	cfg := Default()
 	if err := cfg.Normalize(); err != nil {
@@ -41,9 +42,9 @@ func TestDefaultRulesRouteEveryModelToVerifiedSlug(t *testing.T) {
 	}{
 		{"cline-pass/deepseek-v4.1-flash", "deepseek", "deepseek"},
 		{"cline-pass/deepseek-v4-flash", "deepseek", "deepseek"},
-		{"cline-pass/glm-5.3", "glm-5.3", "zai"},
-		{"cline-pass/glm-5.3-flash", "glm-5.3-flash", "z-ai"},
-		{"z-ai/glm-5.3-flash", "glm-5.3-flash", "z-ai"},
+		{"cline-pass/glm-5.3", "glm-5.3", "friendli"},
+		{"cline-pass/glm-5.3-flash", "glm-5.3-flash", "relace"},
+		{"z-ai/glm-5.3-flash", "glm-5.3-flash", "relace"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.model, func(t *testing.T) {

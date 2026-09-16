@@ -103,15 +103,23 @@ const DefaultMaxBodyBytes int64 = 64 << 20 // 64 MiB
 
 // Default 返回内置默认配置，其中包含针对 DeepSeek 与 GLM 的钉死规则。
 //
-// 这三条规则是 2026-09-16 在真实网关上逐模型探测后确定的，不是猜的。
+// 这些规则是 2026-09-16 在真实网关上逐模型探测 + 逐个测速后确定的，不是猜的。
+//
+// GLM 侧刻意**不钉官方渠道**：实测官方 `zai`/`z-ai` 的首字延迟是
+// 2.0–3.1s / 1.8–2.2s，而下面两个第三方渠道快 3–6 倍。代价是可能落到
+// 量化（fp8/fp4）版本，属于知情取舍。
+//
+//	glm-5.3       → friendli   实测 TTFT 0.31–0.35s（4/4 成功，最稳定）
+//	glm-5.3-flash → relace     实测 TTFT 0.72–0.97s（4/4 成功，最稳定）
+//
 // 注意两条 GLM 规则**必须**保持这个顺序，且不能合并成一条泛化的 `glm`：
 //
-//	cline-pass/glm-5.3-flash 走 direct 管道，可用上游里写的是 `z-ai`
-//	cline-pass/glm-5.3       走 planner 管道，可用上游里写的是 `zai`
+//	cline-pass/glm-5.3-flash 走 direct 管道，渠道池含 relace / z-ai / parasail …
+//	cline-pass/glm-5.3       走 planner 管道，渠道池含 friendli / togetherai / zai …
 //
-// 同一家厂商在不同模型上用了两种 slug。早期版本用一条 `glm` → `z-ai` 的泛化规则，
-// 结果把 glm-5.3 打成 400（"No available providers match the 'only' filter: z-ai"）。
-// 因此这里按「具体在前、泛化在后」排列，并分别锁定各自的正确 slug。
+// 两条管道的渠道池**不通用**：把在一侧测通的 slug 搬到另一侧可能直接失败
+// （实测 glm-5.3-flash 的 morph/novita/makora/baseten/modal 等在 strict 下报
+// stream_initialization_failed）。换 slug 前必须在对应模型上重新测速。
 func Default() *Config {
 	return &Config{
 		Listen:       DefaultListen,
@@ -138,7 +146,7 @@ func Default() *Config {
 				Match:     MatchContains,
 				Pipeline:  PipelineAuto,
 				Mode:      PinStrict,
-				Upstreams: []string{"z-ai"},
+				Upstreams: []string{"relace"},
 			},
 			{
 				Name:      "glm-5.3",
@@ -146,7 +154,7 @@ func Default() *Config {
 				Match:     MatchContains,
 				Pipeline:  PipelineAuto,
 				Mode:      PinStrict,
-				Upstreams: []string{"zai"},
+				Upstreams: []string{"friendli"},
 			},
 		},
 	}

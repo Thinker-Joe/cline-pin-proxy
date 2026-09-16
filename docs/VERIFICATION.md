@@ -269,7 +269,88 @@ https://api.cline.bot/api/v1/v1/chat/completions   →  404 Not Found
 
 ---
 
-## 九、未验证的部分
+## 九、上游测速（GLM 提速取舍，2026-09-16）
+
+背景：官方渠道偏慢。对两个 GLM 模型的**全部候选渠道**逐个实测首字延迟
+（TTFT，取流式响应首字节到达时间）与可用性。
+
+方法：`only: [<上游>]` + `stream: true`，`max_tokens` 128，逐条串行测量；
+每个候选跑 1–4 次，记录 HTTP、TTFT、completion_tokens 与是否报错。
+
+### glm-5.3（planner 管道）
+
+| 上游 | TTFT | 备注 |
+|---|---|---|
+| **friendli** | **0.31 / 0.33 / 0.34 / 0.35s** | 4/4 成功，离散度最小 |
+| deepinfra | 0.31 / 0.44 / 0.45 / 0.48s | 4/4 |
+| togetherai | 0.36 / 0.36 / 0.40 / 0.54s | 4/4 |
+| digitalocean | 0.50 / 0.55 / 0.59 / 0.63s | 4/4 |
+| runware | 0.67s | |
+| parasail | 0.76 / 0.92s | |
+| inceptron | 0.88 / 0.77s | |
+| baseten | 1.13 / 1.38s | |
+| gmicloud | 1.65 / 1.67s | |
+| blackbox | 2.14 / 3.21s | |
+| fireworks | 2.34 / 0.67s | 不稳定 |
+| streamlake | 2.71 / 1.77s | |
+| **`zai`（官方）** | **3.11 / 2.04s** | 基准 |
+| novita | 5.48 / 3.83s | 比官方还慢 |
+| wafer | 5.64 / 0.69s | 极不稳定 |
+| crusoe | 8.63s / 超时 | 避免 |
+| morph | 1.36 / 7.64s | 不稳定 |
+| modal | 超时 / 0.81s | 不稳定 |
+
+→ 选中 **friendli**（最快且 4/4 稳定，比官方快约 6–9 倍）。
+
+### glm-5.3-flash（direct 管道）
+
+| 上游 | TTFT | 备注 |
+|---|---|---|
+| **relace** | **0.72 / 0.76 / 0.80 / 0.97s** | 4/4 成功，最稳定 |
+| cloudflare | 0.62 / 0.77 / 0.96 / 1.14s | 4/4 |
+| parasail | (失败) / 0.66 / 0.70 / 1.02s | **3/4** |
+| friendli | 0.93 → 1.93 → 2.73 → 3.05s | 4/4 但**持续劣化** |
+| fireworks | 三次失败 / 0.74s | **1/4** |
+| streamlake | 1.26 / 1.38s | |
+| siliconflow | 0.95 / 1.81s | |
+| sail-research | 1.07 / 0.88s | |
+| phala | 1.09 / 0.34s | 不稳定 |
+| wafer | 1.37 / 0.81s | |
+| nextbit | 1.76 / 1.38s | |
+| **`z-ai`（官方）** | **1.77 / 2.16s** | 基准 |
+| gmicloud | 2.11 / 1.53s | |
+| digitalocean | 2.11 / 0.38s | 不稳定 |
+| deepinfra | 8.26 / 0.72s | 不稳定 |
+| reka | 8.05 / 0.24s | 不稳定 |
+| venice | 失败 / 4.49s | |
+| **morph / novita / makora / crusoe / coreweave / together / baseten / io-net / modal** | 全部 `stream_initialization_failed` | **strict 下不可用** |
+
+→ 选中 **relace**（4/4 稳定，比官方快约 2.2–2.7 倍）。
+
+### 渠道池不通用
+
+两条管道的候选池**完全不同**：`friendli`、`togetherai` 在 glm-5.3 上很快，
+而 `glm-5.3-flash` 的 `friendli` 会从 0.93s 劣化到 3.05s；反过来
+`relace`、`cloudflare` 只出现在 flash 侧。**换 slug 必须在对应模型上重测。**
+
+### 附：`sort` 参数实测有效
+
+顺带验证了此前一直标为「未实测」的排序参数，两条管道都生效且稳定：
+
+| 模型 | 注入 | 3 次命中 | TTFT |
+|---|---|---|---|
+| glm-5.3 | `providerOptions.gateway.sort = ttft` | digitalocean ×3 | 0.60 / 0.60 / 0.71s |
+| glm-5.3 | `providerOptions.gateway.sort = tps` | friendli ×3 | 0.42 / 0.32 / 0.38s |
+| glm-5.3-flash | `provider.sort = latency` | NextBit / Parasail / Relace | 1.34 / 0.65 / 0.70s |
+| glm-5.3-flash | `provider.sort = throughput` | Parasail / Parasail / Relace | 0.82 / 1.80 / 0.74s |
+
+注意：`sort` **保留回退**，而 `strict` 的 `only` 没有。对 glm-5.3 而言
+`sort: tps` 的效果与直接钉 friendli 相当，但多了一层自动切换——
+如果 friendli 以后变慢，把该条规则改成 `sort` 是一行改动。
+
+---
+
+## 十、未验证的部分
 
 诚实记录当前缺口：
 

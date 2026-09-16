@@ -22,7 +22,7 @@
       "match": "contains",
       "pipeline": "auto",
       "mode": "strict",
-      "upstreams": ["z-ai"]
+      "upstreams": ["relace"]
     },
     {
       "name": "glm-5.3",
@@ -30,7 +30,7 @@
       "match": "contains",
       "pipeline": "auto",
       "mode": "strict",
-      "upstreams": ["zai"]
+      "upstreams": ["friendli"]
     }
   ]
 }

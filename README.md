@@ -128,22 +128,24 @@ sub2api 会拼成 `http://127.0.0.1:8787/v1/chat/completions`，正好命中代�
 
 开箱即用（`contains` 匹配、`strict` 模式、双管道）。**规则按序匹配，具体在前**：
 
-| 命中 | 钉到 | 备注 |
+| 命中 | 钉到 | 实测 TTFT |
 |---|---|---|
-| `*deepseek*` | `deepseek` | 实测在该模型 16 个可用上游之列 |
-| `*glm-5.3-flash*` | `z-ai` | **必须排在 `glm-5.3` 之前** |
-| `*glm-5.3*` | **`zai`** | 注意：与上面不是同一个 slug |
+| `*deepseek*` | `deepseek`（官方） | — |
+| `*glm-5.3-flash*` | `relace` | 0.72–0.97s（4/4 成功） |
+| `*glm-5.3*` | `friendli` | **0.31–0.35s（4/4 成功）** |
 
-⚠️ **同一家厂商在不同模型上用了两种 slug**：`glm-5.3-flash` 的上游叫 `z-ai`，
-而 `glm-5.3` 的叫 `zai`。用一条泛化的 `glm` → `z-ai` 规则会把 `glm-5.3`
-打成 400（`No available providers match the 'only' filter: z-ai`）。
-这两条规则的顺序与 slug 都是承重的，改动前请先 `probe`。
+⚠️ **GLM 刻意不钉官方渠道**：官方 `zai` / `z-ai` 实测首字延迟
+**2.0–3.1s / 1.8–2.2s**，而选中的两个第三方渠道快 **3–6 倍**。
+代价是可能落到量化（fp8/fp4）版本——这是知情的速度/质量取舍。
 
-三条规则都已在真实网关上逐模型验证生效，且经 sub2api 全链路验收 9/9 通过。
-详见 **[docs/VERIFICATION.md](docs/VERIFICATION.md)**。
+⚠️ **两条 GLM 规则必须保持这个顺序，且不能合并成泛化的 `glm`**：
+两条管道的渠道池**不通用**（`glm-5.3` 走 planner、`glm-5.3-flash` 走 direct）。
+把一侧测通的 slug 搬到另一侧可能直接失败——实测 `glm-5.3-flash` 在 strict 下的
+`morph`/`novita`/`makora`/`baseten`/`modal` 等会报 `stream_initialization_failed`。
+**换 slug 前必须在对应模型上重新测速。**
 
-⚠️ 上游 slug 会随 Cline 侧渠道池变动，清单只是快照。
-**上线前请用 `probe` 子命令在你自己的账号上复核。**
+所有 slug 与延迟均来自真实网关实测，经 sub2api 全链路验收。
+完整数据见 **[docs/VERIFICATION.md](docs/VERIFICATION.md)**。
 
 ### 配置文件
 
