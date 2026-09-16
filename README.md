@@ -2,7 +2,8 @@
 
 把 [Cline Pass](https://cline.bot/cline-pass) 订阅模型背后的**上游渠道钉死**的一个轻量透传代理。
 
-单文件 Go 程序，**零第三方依赖**，约 2.1k 行源码 + 2.1k 行测试，distroless 镜像约 5 MB。
+单二进制 Go 程序（源码是多包布局，产物只有一个静态链接的可执行文件），
+**零第三方依赖**，约 2.4k 行源码 + 2.5k 行测试，distroless 镜像约 5 MB。
 
 ```
 你的调用方  ──►  cline-pin-proxy  ──►  Cline Pass  ──►  指定上游
@@ -174,11 +175,19 @@ cp config.example.json config.json      # Docker 部署则是 data/config.json
   "rules": [
     {
       "name": "deepseek-official",
-      "model": "deepseek-v4.1-flash",
+      "model": "deepseek",
       "match": "contains",
       "pipeline": "auto",
       "mode": "strict",
       "upstreams": ["deepseek"]
+    },
+    {
+      "name": "glm-5.3-flash",
+      "model": "glm-5.3-flash",
+      "match": "contains",
+      "pipeline": "auto",
+      "mode": "strict",
+      "upstreams": ["relace"]
     },
     {
       "name": "glm-prefer-fast",
@@ -191,6 +200,12 @@ cp config.example.json config.json      # Docker 部署则是 data/config.json
   ]
 }
 ```
+
+⚠️ **一旦文件里出现 `rules`，内置默认规则表就被整体替换**（而不是合并）。
+所以示例里把三条都写全了。**不要把 `glm-5.3-flash` 和 `glm-5.3` 合并成一条
+泛化的 `glm`**：前者走 direct 管道、后者走 planner，两条管道的渠道池不通用，
+一条规则同时匹配两者时，总有一侧会被钉到它没有的渠道上。
+`rules: []` 是合法的——表示显式关闭钉死，全部交给 Cline Pass 自主路由。
 
 ### 字段说明
 
@@ -250,8 +265,10 @@ sudo vim data/config.json
 - **文件被删除也不会中断**。配置回落到上次成功的值，等文件重新出现后再接管。
 
 > 为什么值得做这个：`docker compose up -d` 察觉不到挂载文件的内容变化，不会重建容器，
-> 改完配置毫无反应，是个很容易误判成「配置没写对」的坑。`restart` 虽然能生效，
-> 但要中断一次服务；对「换个 slug 试试速度」这种高频操作，热重载几乎是无成本的。
+> 改完配置毫无反应，是个很容易误判成「配置没写对」的坑。`restart` 其实能生效
+> （重新读一次文件），但要中断一次服务；对「换个 slug 试试速度」这种高频操作，
+> 热重载几乎是无成本的。真正**只有热重载能救**的场景，是下面这种环境变量遮蔽 ——
+> 见[环境变量与配置文件的优先级](#环境变量与配置文件的优先级)。
 
 ### 管理 API
 
@@ -279,7 +296,8 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
      -d '[{"name":"glm","model":"glm-5.3","match":"contains","mode":"strict","upstreams":["friendli"]}]' \
      http://127.0.0.1:8787/admin/rules
-# {"ok":true,"applied":true,"persisted":true,"rules":1}
+# {"ok":true,"applied":true,"persisted":true,"rules":[{"name":"glm",...}]}
+# 「规则」字段是生效后的完整规则数组，不是数量。
 
 # 加个新模型前先看看有哪些渠道
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -317,6 +335,23 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
 > 配置里的 `api_key`、`admin_token` 属敏感字段，**环境变量的值不会被写回配置文件** ——
 > 通过 `PUT /admin/rules` 落盘时只替换 `rules` 键，其余内容原样保留。
 
+### 环境变量与配置文件的优先级
+
+**环境变量 > 配置文件 > 内置默认值**。这条规则的副作用值得单独说清楚：
+
+> 只要环境变量**非空**，它就赢，配置文件里同名字段改什么都不会生效 ——
+> 热重载也一样，因为热重载只重新读文件，然后又被环境变量盖回去。
+
+空字符串（或纯空白）等同于"没设置"，不参与覆盖。所以想让配置文件说了算，
+就不要给那个变量赋值。
+
+Docker 部署尤其要注意这点：compose 里写 `${VAR:-某个默认值}` 会**无条件**把
+默认值注入容器，于是配置文件里的 `upstream` / `forward_headers` 永远被遮蔽。
+本项目的 `docker-compose.yml` 因此统一用空默认值 `${VAR:-}`，把默认值留给应用本身。
+
+**显式给出的非法值会让启动失败**，不会被静默忽略：把 `CLINE_PIN_RULES='[{bad'`
+当成"没配置"，会让运维者以为规则表已经覆盖了，实际继续走默认渠道。
+
 ---
 
 ## 探测上游
@@ -346,6 +381,11 @@ cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
 **原理**：给请求注入一个绝不存在的上游名（`__probe__`），网关会在路由层直接失败。
 因为不存在任何可用候选，这次请求走不到推理后端，**基本不消耗 token**，
 而错误信息里会带上它当前可用的完整渠道清单。
+
+严格说这**不是无条件免费**：它依赖"网关在路由层就拦下"。对会执行该过滤器的模型，
+请求根本到不了推理后端（不产生 token）；但实测也发现过个别模型忽略过滤器、
+照常返回正文的情况（见 [docs/VERIFICATION.md](docs/VERIFICATION.md) 第二节），
+那种情况会正常计费。想完全确定，先看返回里有没有可用清单。
 
 两条管道的错误格式不同，代理会分别解析；`-pipeline` 可强制指定以排查管道归属。
 
@@ -400,17 +440,28 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
 
 这些是刻意设计的，改动前请先想清楚：
 
-- **只注入 `POST /v1/chat/completions`**（含 `/chat/completions`、`/api/v1/chat/completions`）。
+- **只注入 `POST /v1/chat/completions`**（含 `/chat/completions`、`/api/v1/chat/completions`
+  三种写法，都会归一化成上游基址下的同一路径）。
   其余端点纯净透传——调用方靠它们探测上游能力，代理不该干扰结论。
 - **未命中规则时完全原样转发**，由 Cline Pass 自主路由。不会偷偷钉任何东西。
 - **注入失败时降级为未钉死透传**，并在 `X-Cline-Pin-Note` 里注明，避免"以为钉住了"。
 - **上游状态码与响应体原样回传**，调用方的故障转移逻辑才不会失灵。
+  因此**不跟随重定向**：30x 连同 `Location` 原样返回，而不是替调用方把 302 跟成 200。
+- **上游中途断开时主动断连**。响应头一旦发出就无法再改成 5xx，如果只是安静返回，
+  下游会把残缺内容当成"正常结束"（`Content-Length` 不透传，HTTP 层没有失败信号）。
+  代理会以 `http.ErrAbortHandler` 断开连接，客户端因此拿到 `unexpected EOF`。
 - **流式响应逐块 Flush**，全程 O(1) 内存，不做任何 JSON 解析。
   这是首字延迟不退化的前提。
 - **不设 `http.Client.Timeout`**：流式生成可能持续数分钟，整体超时会把长回答砍断。
   超时改由 dial / TLS / 响应头三段分别控制。
 - 注入采用「解析 → 深度合并 → 重新编码」，数字用 `json.Number` 承载、
   且关闭 HTML 转义，保证除注入字段外请求体语义完全不变（含大整数精度与 `< > &` 原样保留）。
+- **代理是路由字段的唯一决定者**。在它写入的那条管道上，`only` / `order` /
+  `allow_fallbacks` / `sort` 以配置为准：`preferred` 会清掉调用方自带的 `only`
+  与 `allow_fallbacks=false`，否则多候选会静默退化成"只用第一个"。
+  其它字段（包括 `require_parameters`、`data_collection` 等）一律不动。
+- **一次请求只用一份配置快照**。热重载在请求处理中途生效也不会让这次请求
+  混用新旧配置（旧上游 + 新密钥）。
 
 ---
 
@@ -420,11 +471,17 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
   容器内需监听 `0.0.0.0`，但 `docker-compose.yml` 把宿主机端口绑定限制在回环。
 - 请求头**白名单透传**，白名单外的一律不外泄到上游。
 - 响应头同样白名单，且刻意不转发 `Content-Length`（注入会改变长度）。
-- 路径白名单限制在 `/v1/` 与 `/api/v1/`，代理不会变成访问上游任意路径的跳板。
-- 请求体有大小上限，超限返回 413 而不是把内存读满。
+- 路径白名单限制在 `/v1/` 与 `/api/v1/`，**并拒绝任何百分号转义与点段**：
+  `/v1/%2e%2e/%2e%2e/admin` 这类编码穿越在 Go 1.22+ 上不会被 ServeMux 规范化，
+  拿去拼上游 URL 就能跳出 API 前缀。支持的 OpenAI 端点路径不含需要转义的字符，
+  所以直接拒绝比猜测安全。
+- 请求体有大小上限，超限返回 413 而不是把内存读满；**透传端点同样执行**
+  （已知长度直接拒，chunked 靠 `MaxBytesReader` 在读取中拦截）。
 - **管理 API 默认整体关闭**（未设 `admin_token` 时返回 404 而非 403），
   令牌比较用 `crypto/subtle` 常量时间实现；`GET /admin/config` 会隐去
   `api_key` 与 `admin_token`，避免把密钥回显给调用方。
+- 写回配置**只在确认"原子替换做不到"**（目录不可写、只读挂载）时才退化为
+  原地覆盖。磁盘满、I/O 错误这类内容写失败会直接报错，不会去截断唯一的配置文件。
 - 配置里的 `api_key` 是明文。别把 `config.json` / `data/` 提交进 git（`.gitignore` 已排除）。
 
 ---
@@ -439,12 +496,14 @@ gofmt -l .                 # 应为空
 go test -cover ./...
 ```
 
-覆盖率：`pin` 96.1% / `admin` 95.2% / `probe` 92.0% / `config` 89.7% / `proxy` 84.1%
-（`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支）。
+覆盖率：`pin` 94.5% / `admin` 94.9% / `probe` 92.0% / `config` 88.6% / `proxy` 84.7% / `cmd` 22.6%
+（`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支；
+`cmd` 只覆盖了子命令分发与 `check`/`healthcheck`，`serve` 的启动路径要真实起服务，未纳入）。
 
 CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；
-打 tag 时构建 `linux/amd64`、`linux/arm64` 多架构镜像推到 GHCR，
-并附带 5 个平台的裸二进制。
+`Release` 工作流**自己也带一道同样的验证门禁**（单测没过就不会推镜像），
+通过后构建 `linux/amd64`、`linux/arm64` 多架构镜像推到 GHCR，
+打 tag 时额外附带 5 个平台的裸二进制。
 
 ---
 

@@ -253,3 +253,68 @@ CLI 包没有测试。后续至少应验证 check 对显式非法配置返回失
 3. 最后补齐请求体边界、压缩协商、Compose/发布门禁和持久化失败保障，同步文档。
 
 本次未修改业务源码、已有测试、运行配置或部署；仅新增本报告。以上问题均为待修复状态。
+
+---
+
+# 处置结果（2026-09-16，修复提交 `d8e3fc5`）
+
+**结论：18 项全部成立，全部已修复。** 没有直接照单全收——逐条先写"断言正确行为"
+的边界测试复现，再改代码。13 项行为类缺陷全部在修复前**确定性复现**；
+5 项静态审查项（14/15/16 及文档类）读码确认。
+
+审查测试已作为长期回归留在仓库里，每条都注明来源：
+
+| 文件 | 覆盖的项 |
+|---|---|
+| `internal/proxy/boundary_test.go` | 1、2、3、6、7、11、13 |
+| `internal/config/boundary_test.go` | 4、5、9、12、16、17、18 |
+| `internal/admin/boundary_test.go` | 10 |
+| `internal/pin/boundary_test.go` | 8 |
+| `cmd/cline-pin-proxy/main_test.go` | CLI 覆盖缺口（0% → 22.6%） |
+
+## 逐项处置
+
+| # | 结论 | 修复方式 |
+|---|---|---|
+| 1 | 成立 | 新增 `safeRoutePath`：拒绝一切百分号转义与点段。根因已定位到 Go 1.22+ 的 ServeMux 用 `EscapedPath()` 做 cleanPath 匹配，而处理器读到的 `URL.Path` 已解码 |
+| 2 | 成立 | 入口取一次 `cfg` 快照，显式传给读体/匹配/转发/复制请求头；测试断言"一次请求只调一次 `Current()`" |
+| 3 | 成立 | `flushCopy` 非正常错误时 `panic(http.ErrAbortHandler)` 主动断连；真实 socket 测试断言下游拿到读错误而非 `err==nil` |
+| 4 | 成立 | `Load` 不再整体 `Unmarshal` 到 `cfg`；新增 `applyFile` 逐字段解码到零值，`rules` 整体替换 |
+| 5 | 成立 | 落盘成功后 `reloadLocked(true)` 强制重读，内存与磁盘对齐 |
+| 6 | 成立 | `joinUpstream` 同时剥离 `/api/<ver>` 与 `/<ver>`，补 10 组路径矩阵测试 |
+| 7 | 成立 | `CheckRedirect` 返回 `ErrUseLastResponse`，`location` 加入响应头白名单 |
+| 8 | 成立 | `applyChoice` 直接改写目标层对象：`preferred` 清 `only` 与 `allow_fallbacks`，`strict` 清 `order` |
+| 9 | 成立 | 顶层 `null` 在 `Load`、`applyFile`、`persistRulesLocked` 三处都拒绝 |
+| 10 | 成立 | `decodeRules` 拒绝裸 `null` 与 `null` 元素；清空只能显式写 `[]`。注：报告中 `[null]` 在真实 store 下本会被 `Rule.Normalize` 拦下，已在解码层也加一道 |
+| 11 | 成立 | 透传路径：已知 `Content-Length` 超限直接 413，chunked 用 `MaxBytesReader` 并在传输层错误上映射回 413 |
+| 12 | 成立 | `applyEnv` 返回 error，显式非法值一律让加载失败（`CLINE_PIN_MAX_BODY_BYTES` / `WATCH_SECONDS` / `ADMIN_ALLOW_UNAUTHENTICATED` / `RULES`） |
+| 13 | 成立 | `content-encoding` 加入响应头白名单；断言改为"要么保留编码声明、要么给出可解析明文"，不依赖压缩字节 |
+| 14 | 成立 | compose 全部改为 `${VAR:-}` 空默认，默认值交还应用；README 新增"环境变量与配置文件的优先级"小节 |
+| 15 | 成立 | `release.yml` 新增 `verify` job（gofmt + vet + `test -race` + `go mod tidy` 校验），`docker` 与 `binaries` 都 `needs` 它 |
+| 16 | 成立 | 新增 `isAtomicReplaceUnavailable`：只有 `EACCES`/`EPERM`/`EROFS`/`EXDEV`/`ENOTSUP` 才退化为原地覆盖；`ENOSPC`/`EIO` 直接报错保住原文件。补测试锁定分类 |
+| 17 | 成立 | 落盘改用 `map[string]json.RawMessage`，只替换 `rules` 键；测试断言 `2^53+1` 逐字保留 |
+| 18 | 成立 | 新增 `validateUpstream`：`url.Parse` + 校验 scheme/host/转义，拒绝 query 与 fragment；`userinfo` 仍然允许 |
+
+## 报告中被采纳的两点澄清
+
+- **`[null]`（第 10 项）**：真实 `Store` 下会被 `Rule.Normalize` 的 "model must not be
+  empty" 拦下，不会静默生效。报告把它与裸 `null` 并列，前者实际不构成漏洞；
+  但为了 API 边界的自洽，仍在 `decodeRules` 里显式拒绝。
+- **第 13 项的复现方式**：初版回归测试用"正文里能否找到明文"判断，会**假阴性**
+  ——deflate 对小输入可能用 stored 块，明文会字面出现在压缩流里。已改为检查
+  `Content-Encoding` 声明，与压缩算法无关。
+
+## 顺带修掉的一个小问题
+
+`cline-pin-proxy -h` 实际会走 `serve` 的 flag 解析并以
+`error: flag: help requested` 退出码 1；README 把它当帮助用法。现在
+`run` 把 `flag.ErrHelp` 归一化为成功。
+
+## 仍未处理
+
+- **`go test -race` 未在本地跑过**：Windows 上没有 GCC，`CGO_ENABLED=0`。
+  已由 CI 与 `release.yml` 的 `verify` job 覆盖（`ubuntu-latest` + `-race`）。
+- **arm64 实际运行**：仍只验证了 manifest 可拉取，未在 arm64 机器上跑过。
+- **CLI `serve` 启动路径**：`cmd` 覆盖率 22.6%，`serve` 的启动/失败/退出路径
+  仍未纳入测试（需要真实绑定端口，未纳入本轮范围）。
+

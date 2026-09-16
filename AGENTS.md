@@ -59,6 +59,7 @@ Docker：`docker compose up -d`，配置挂载在 `./data/config.json`，改它*
 | `internal/admin/` | 管理 API（默认整体 404 关闭） |
 | `internal/probe/` | 用 `__probe__` 假上游名从网关错误信息反解可用渠道清单 |
 | `docs/VERIFICATION.md` | 真实网关实测记录，slug 与管道结论的唯一权威来源 |
+| `docs/CODE_REVIEW.md` | 外部审查报告 + 逐项处置结果；`*_test.go` 里的 `boundary_*.go` 是它留下的回归 |
 
 ## 行为不变量（改动前必读）
 
@@ -67,18 +68,35 @@ Docker：`docker compose up -d`，配置挂载在 `./data/config.json`，改它*
 - 只注入 `POST /v1/chat/completions`；**其余端点纯净透传**，调用方靠它们探测上游能力。
 - 未命中规则时完全原样转发；注入失败时降级为未钉死透传并在 `X-Cline-Pin-Note` 注明。
 - 上游状态码与响应体**原样回传**，调用方的故障转移逻辑依赖这一点。
+  由此推出两条硬约束：**不跟随重定向**（`CheckRedirect` 返回 `ErrUseLastResponse`，
+  30x 连同 `Location` 原样回传）；**上游中途断开时主动断连**
+  （`panic(http.ErrAbortHandler)`），否则下游会把残缺内容当成正常结束。
+- **路径必须先过 `safeRoutePath`**：拒绝一切百分号转义与点段。
+  Go 1.22+ 的 ServeMux 用 `EscapedPath()` 做 cleanPath 匹配，`%2e%2e` 不会被规范化，
+  而处理器读到的 `URL.Path` 已解码——直接用它会拼出能跳出 `/v1/` 前缀的上游地址。
+- **一次请求只用一份配置快照**（`handle` 里取一次 `cfg` 往后传），
+  否则热重载插在中间会让请求发往旧上游却带新密钥。
 - 流式响应逐块 Flush、全程 O(1) 内存、不解析响应体；**不设 `http.Client.Timeout`**，
   超时由 dial / TLS / 响应头三段分别控制（整体超时会砍断长流式回答）。
 - 注入用 `json.Number` 承载数字、关闭 HTML 转义，保证除注入字段外请求体语义不变
   （大整数精度、`< > &` 原样保留）——改注入逻辑必须保留这两点并跑 `pin` 包测试。
+- 注入时**代理是路由字段的唯一决定者**：在它写入的那条管道上，`preferred` 会清掉
+  调用方的 `only` 与 `allow_fallbacks=false`（否则回退顺序静默失效），`strict` 清掉
+  `order`。其它字段一律不动。
 - 内置 GLM 两条规则的顺序与 slug 有实测依据（`glm-5.3`→friendli、`glm-5.3-flash`→relace，
   两条管道渠道池不通用），**不要合并成泛化的 `glm`，不要调整顺序**；
   换 slug 前先 `probe` 并在对应模型上实测，结论写进 `docs/VERIFICATION.md`。
 - 配置解析失败或文件被删除时**保持上一份好配置继续生效**，不中断服务。
   但**启动时文件非法会直接失败**（只有「文件不存在」才降级为默认值）——这是有意的
   不对称：缺失是「还没配」，非法是「配错了」，静默降级会让人以为规则生效了。
+- 配置文件里**一旦出现 `rules` 就是整体替换**，不与内置默认表合并；
+  同理，**显式给出但非法的环境变量一律让加载失败**，不静默回退。
+- 写回配置只替换 `rules` 键（用 `map[string]json.RawMessage` 保数字精度），
+  且**只在确认"原子替换做不到"**时才退化为原地覆盖；`ENOSPC`/`EIO` 直接报错，
+  绝不截断唯一的配置文件。
 - 管理 API 未配置 `admin_token` 时**整组返回 404**（不是 403），且 `GET /admin/config`
-  必须隐去 `api_key` 与 `admin_token`。改这两条前先说明影响。
+  必须隐去 `api_key` 与 `admin_token`。`PUT /admin/rules` 拒绝 `null`
+  （清空只能显式写 `[]`），裸数组与 `{"rules":[...]}` 两种写法都接受。
 
 ## 约定与验收
 
