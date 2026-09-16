@@ -1,669 +1,371 @@
 # cline-pin-proxy
 
-把 [Cline Pass](https://cline.bot/cline-pass) 订阅模型背后的**上游渠道钉死**的一个轻量透传代理。
-顺带堵上 Cline 响应包封那道**没人负责的层间缝隙**。
+[简体中文](README.zh-CN.md)
 
-单二进制 Go 程序（源码是多包布局，产物只有一个静态链接的可执行文件），
-**零第三方依赖**，约 2.4k 行源码 + 2.5k 行测试，distroless 镜像约 5 MB。
+A Go proxy that selects inference providers for models served through the Cline API and converts Cline's wrapped JSON completions to the OpenAI response format. Provider selection supports model IDs with or without the `cline-pass/` prefix, where the model honors Cline's routing fields.
 
-```
-你的调用方  ──►  cline-pin-proxy  ──►  Cline Pass  ──►  指定上游
- (sub2api        ① 注入上游偏好          api.cline.bot      deepseek / z-ai / …
-   等任何        ② 还原响应包封
-   OpenAI 客户端)    （仅非流式）
+It builds into one executable, uses only the Go standard library, and supports streaming responses, configuration reloads, and an optional admin API.
+
+```text
+OpenAI-compatible client → cline-pin-proxy → Cline API → inference provider
 ```
 
-**它做两件事：**
+## Quick start
 
-1. **钉死上游** —— 双管道注入，绕开「客户端无法控制实际走哪家」的限制（[见下](#它解决什么问题)）。
-2. **还原 Cline 的非标准响应包封** —— Cline 会把非流式补全包进 `data` 壳，而客户端
-   只读顶层 `choices`，结果是**「HTTP 200，但没有内容」**。这是个存在已久、却因为
-   "只影响客户端、不影响计费"而没人修的层间缝隙
-   （[见下](#它还顺手堵上了-cline-的响应包封缝隙)）。
+### Docker Compose
 
----
+Requires Docker with the Compose v2 plugin (`docker compose version`). Copy the files below into a deployment directory; no repository checkout or local Go installation is needed. The image supports `linux/amd64` and `linux/arm64`. The commands below use Bash.
 
-## 它解决什么问题
+**1. Create the deployment directory and Compose file.**
 
-Cline Pass 的订阅模型背后不是单一上游，而是一串第三方推理服务（`deepseek`、`z-ai`、
-`baseten`、`novita`、`gmicloud`、`fireworks`……），由 Cline 网关自己调度。
-不同渠道的成本、速度、量化格式不一样，但**客户端无法控制实际走哪家**。
+```bash
+mkdir -p cline-pin-proxy/data
+cd cline-pin-proxy
+```
 
-原因在于 Cline 网关后面有**两条互不相同的分流管道**，钉死写法完全不同：
+Save the following as `docker-compose.yaml`. It uses the same settings as the repository's [docker-compose.yml](docker-compose.yml):
 
-| 管道 | 实际后端 | 识别特征 | 钉死写法 |
-|---|---|---|---|
-| **planner** | Vercel AI Gateway | 响应带 `provider_metadata.gateway.routing` | `providerOptions.gateway.only` |
-| **direct** | OpenRouter | 响应顶层带 `provider` 字段 | 顶层 `provider.only` |
+```yaml
+services:
+  cline-pin-proxy:
+    image: ghcr.io/thinker-joe/cline-pin-proxy:latest
+    container_name: cline-pin-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-}
+      CLINE_PIN_API_KEY: ${CLINE_PIN_API_KEY:-}
+      CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-}
+      CLINE_PIN_LOG_LEVEL: ${CLINE_PIN_LOG_LEVEL:-info}
+    volumes:
+      - ./data:/etc/cline-pin-proxy
+    command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/cline-pin-proxy", "healthcheck", "-url", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+```
 
-**关键**：对 planner 管道，顶层 `provider.only` 会被 Cline 网关**直接丢弃**——
-这正是「在官方 API 上写 `provider.only` 换上游不生效」的原因。反过来 direct 管道
-会忽略 `providerOptions`。
+**2. Create the configuration.**
 
-管道归属由 Cline 侧决定而非客户端，**所以你无法提前知道该写哪一种**。
-
-本代理的做法是**两条管道都写**：
+Save the following as `data/config.json`. Keep any existing configuration if you are updating a deployment.
 
 ```json
 {
-  "model": "cline-pass/deepseek-v4.1-flash",
-  "messages": [ ... ],
-  "providerOptions": { "gateway": { "only": ["deepseek"] } },
-  "provider":        { "only": ["deepseek"] }
+  "api_key": "",
+  "admin_token": ""
 }
 ```
 
-每条管道各取所需，互不干扰。实测确认这说明来自
-[cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher) 与
-[cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) 两个独立项目的公开记录。
+Omitting `rules` keeps the [default rules](#default-rules); other omitted fields use application defaults. Each client supplies its own Cline API key. To use one upstream key for all requests, fill in `api_key`. Set `admin_token` only if you need the [admin API](#admin-api).
 
-> **实测结论（2026-09-16，真实网关 + sub2api 全链路）**：
-> `cline-pass/deepseek-v4.1-flash` 走 **planner**、`cline-pass/glm-5.3-flash` 走
-> **direct**、`cline-pass/glm-5.3` 又是 **planner**，管道归属稳定但**逐模型不同**
-> ——这正是必须双写的原因。
-> 完整证据、成本数据与真实测试抓出的 bug 见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。
+**3. Start and check the service.**
 
----
-
-## 它还顺手堵上了 Cline 的响应包封缝隙
-
-这一条不在最初的计划里，是接进真实调用链之后被流量暴露出来的。
-
-**现象**：客户端拿到 `HTTP 200`、`finish_reason: "stop"`、用量也正常，
-**但内容是空的**。没有报错、没有非 200、没有任何失败信号——就是读不出东西。
-
-**原因**：Cline 对**非流式**请求会把整个补全包在一个 `data` 壳里：
-
-```json
-{
-  "data": {
-    "id": "gen_01M2…", "object": "chat.completion", "model": "vmc/k3-contributor-fallbacks",
-    "choices": [ { "index": 0, "message": { "content": "ok", "role": "assistant" },
-                   "finish_reason": "stop" } ],
-    "usage": { "prompt_tokens": 103, "completion_tokens": 16, "total_tokens": 119 }
-  },
-  "success": true
-}
+```bash
+docker compose pull
+docker compose up -d --wait
+docker compose ps
+curl -fsS http://127.0.0.1:8787/healthz
 ```
 
-而几乎全部 OpenAI 客户端——官方 SDK、各类网关、形形色色的适配器——都只读**顶层**
-`choices`。顶层没有，就当成"这次没有内容"。
+`--wait` waits for the container healthcheck to pass. The endpoint returns `{"status":"ok"}`; it checks the proxy process, not upstream availability. If startup fails, inspect `docker compose logs --tail=100 cline-pin-proxy`.
 
-### 影响范围：**所有**走 Cline 的模型，不是某个模型的毛病
+**4. Connect a client.**
 
-实测账号映射的 6 个上游模型名——`cline-pass/deepseek-v4.1-flash`、
-`cline-pass/deepseek-v4-flash`、`cline-pass/deepseek-v4-pro`、`cline-pass/glm-5.3`、
-`cline-pass/glm-5.3-flash`、`cline-pass/kimi-k3`——非流式**无一例外**都带包封。
+Use `http://127.0.0.1:8787/v1` as the Base URL and your Cline API key as the API key. See the [test request](#client-configuration) below. Port 8787 is published only on the Docker host's loopback interface. For a client in another container, use a shared Docker network and `http://cline-pin-proxy:8787/v1`; see [sub2api integration](#sub2api-integration).
 
-所以"只有某个模型中招"是**错觉**：那只是**当时恰好只有那个模型被路由到了 Cline 账号**。
-同一个模型名换个账号服务就恢复正常——这正是它难以归因的原因，也说明
-**修复必须做成通用的**，不能只给某个模型打补丁。
+**Manage the deployment.** Run these commands from the directory containing your Compose file:
 
-### 为什么这个坑藏得很深
-
-三个条件叠在一起，让它极难归因：
-
-1. **只有非流式会这样。** 流式 SSE 的事件是标准形状——上游网关为了计费必须解析
-   SSE，重发时就已经标准化了。于是表现为"同一个模型，流式好好的、非流式没内容"。
-2. **只有请求被路由到 Cline 账号时才出现。** 同一个模型名通常由多个账号共同服务，
-   换一个账号就恢复正常。表现是"时好时坏"，很容易被误判成上游抖动。
-3. **上游网关通常不会修它，因为对计费没有影响。** 以 sub2api 为例：它在源码注释里
-   **明确记录了这个形状**，但兼容只做在用量统计上（读 `data.usage`），
-   **正文仍然原样透传**；它那套「按账号改写响应」的钩子只挂了 Ollama Cloud。
-   站在计费网关的立场这完全合理——用量对得上，职责就完成了。
-
-结果就是：**这是一道没人负责的层间缝隙，而客户端正站在缝隙底下。**
-
-### 本代理的做法
-
-把 `data` 里那层提出来当正文：
-
-```
-Cline 发来：  {"data": { "choices":[…], "usage":{…}, "model":"…" }, "success": true}
-                 └────────────────────┬─────────────────────┘
-回给客户端：            { "choices":[…], "usage":{…}, "model":"…" }
-```
-
-代理本来就在这条链路上，所以这一步放在这里最省事：**任何客户端都能拿到正常响应**，
-不必指望每个下游都自己兼容 Cline 的怪癖，也**不受账号调度变化的影响**
-（明天这个模型换到别的账号服务，行为也不会变）。
-
-### 三条硬约束（这是它敢默认开启的原因）
-
-| 约束 | 做法 |
+| Task | Command |
 |---|---|
-| **只认精确形状** | 顶层无 `choices` + `data` 是对象 + `data.choices` 是非空数组。标准响应、`/v1/models` 的 `data` 数组、错误体、纯数组…一律原样转发（10 组反例测试锁定） |
-| **SSE 一个字节都不缓冲** | 只看 `Content-Type` 是 JSON 才进这条路径。有测试断言"上游仍挂起时下游必须已收到首字节"，防止日后有人为省事把流式也缓冲了 |
-| **超限不静默跳过** | 缓冲上限 8 MiB，超过则原样流式转发并打 `X-Cline-Pin-Unwrapped: skipped-too-large`。宁可还原不了也不 OOM，且**明确告知**——静默跳过会让人以为代理坏了 |
+| View status | `docker compose ps` |
+| Follow logs | `docker compose logs -f --tail=100 cline-pin-proxy` |
+| Stop temporarily | `docker compose stop` |
+| Start again | `docker compose start` |
+| Restart the process | `docker compose restart cline-pin-proxy` |
+| Remove the container and Compose network | `docker compose down` |
 
-另外：读到一半断开时按既有约定主动断连，不把半截 JSON 当完整响应返回；
-还原后补 `Content-Length`，避免下游按错误长度截断或挂起。
+The host directory `data/` is mounted at `/etc/cline-pin-proxy` in the container and remains after `docker compose down`. Edit `data/config.json` to change rules; most settings reload within five seconds by default. See [reloading](#reloading) for startup-only settings and environment overrides.
 
-### 实测对照
-
-同一生产环境，**只拨这一个开关**，其他一切不动：
-
-| `unwrap_data_envelope` | 客户端看到 | 结果 |
-|---|---|---|
-| **开启**（默认） | 顶层 `choices` | 正常 |
-| **关闭** | `{"data":{"choices":…},"success":true}` | **读不出内容（复现原始症状）** |
-| 恢复开启 | 顶层 `choices` | 正常 |
-
-包封完全跟着开关走，因此可以排除"只是上游或路由变了"这个替代解释。
-
-### 自己验证
+Validate the file and preview a rule using the running container:
 
 ```bash
-# 看开关当前值
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/config | jq .unwrap_data_envelope
-
-# 打一次非流式请求，看顶层有没有 choices
-curl -s -X POST http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer $CLINE_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"cline-pass/kimi-k3","messages":[{"role":"user","content":"hi"}],"max_tokens":256}' \
-  | jq 'has("choices"), (.choices[0].message.content // "（读不出内容）")'
-
-# 还原发生时响应头会说明
-curl -sD - -o /dev/null -X POST http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer $CLINE_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"cline-pass/kimi-k3","messages":[{"role":"user","content":"hi"}],"max_tokens":256}' \
-  | grep -i x-cline-pin-unwrapped
+docker compose exec cline-pin-proxy /usr/local/bin/cline-pin-proxy \
+  check -config /etc/cline-pin-proxy/config.json -model deepseek/deepseek-v4-flash
 ```
 
-> **提示**：验证时把 `max_tokens` 给足（≥256）。推理模型在小预算下会把额度全花在
-> 思考上、正文为空，上游会回 `empty response content`——那是另一回事，
-> 很容易误判成包封问题。
-
-需要严格原样透传的部署可以关掉：
-
-```json
-{ "unwrap_data_envelope": false }
-```
-
----
-
-## 快速开始
-
-### Docker（推荐）
+To update the image, pull it and recreate the service. This briefly interrupts service and keeps `data/`:
 
 ```bash
-# 1) 准备配置（内置默认规则已覆盖 DeepSeek 与 GLM，可以先不改）
-mkdir -p data && cp config.example.json data/config.json
-
-# 2) 起服务
-CLINE_PIN_API_KEY=sk_xxx docker compose up -d
-
-# 3) 确认活着
-curl -s http://127.0.0.1:8787/healthz
+docker compose pull
+docker compose up -d --wait
 ```
 
-配置文件挂在 `./data/config.json`，**改它不用重启容器** —— 见[热重载](#热重载)。
+`docker compose restart` does not switch to a newly pulled image. For a local source build, use a repository checkout, uncomment `build: .` in its `docker-compose.yml`, and run `docker compose up -d --build --wait`.
 
-镜像也已发布到 GHCR：
+### Binary
 
-```bash
-docker pull ghcr.io/thinker-joe/cline-pin-proxy:latest
-```
-
-### 单文件二进制
+Download a binary from [GitHub Releases](https://github.com/Thinker-Joe/cline-pin-proxy/releases), or build with Go 1.23 or later:
 
 ```bash
 go build -o cline-pin-proxy ./cmd/cline-pin-proxy
-CLINE_PIN_API_KEY=sk_xxx ./cline-pin-proxy serve
+cp config.example.json config.json
+./cline-pin-proxy serve -config config.json
 ```
 
-### 客户端接入
+`-config` is explicit: the binary does not automatically load `config.json` from the working directory. Without it, configuration comes from defaults and environment variables.
 
-把任何 OpenAI 兼容客户端的 Base URL 指过来即可：
+### Client configuration
 
-```
-Base URL: http://127.0.0.1:8787/v1
-API Key:  sk_xxx（Cline Pass 的 key）
-Model:    cline-pass/deepseek-v4.1-flash
-```
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8787/v1` |
+| API key | A Cline API key with access to the requested model |
+| Example model | `cline-pass/deepseek-v4.1-flash` |
 
----
+By default, the proxy forwards the client's `Authorization` header. Set `api_key` or `CLINE_PIN_API_KEY` to use a fixed upstream key instead. A fixed key replaces client credentials; it does **not** enable authentication on the proxy's public API routes.
 
-## 接入 sub2api
-
-典型场景：sub2api 把 Cline Pass 当成一个 **openai 平台的 api-key 账号**，
-你希望这个账号转出去的请求被钉到 DeepSeek / GLM 官方渠道。
-
-把该账号的 `base_url` 从 `https://api.cline.bot/api/v1` 改成代理地址即可：
-
-```
-https://api.cline.bot/api/v1   →   http://127.0.0.1:8787/v1
-```
-
-sub2api 会拼成 `http://127.0.0.1:8787/v1/chat/completions`，正好命中代理的注入端点。
-
-三个衔接细节：
-
-1. **凭据**。若代理配了 `CLINE_PIN_API_KEY`，sub2api 账号里的 key 填什么都行（会被覆盖）；
-   若留空，则 sub2api 账号里的 key 必须是真实的 Cline Pass key。
-2. **`x-client-type` 请求头**。sub2api 常用 `header_override` 注入
-   `x-client-type: cline-cli`，代理默认已把它透传（见 `CLINE_PIN_FORWARD_HEADERS`）。
-3. **`/v1/responses` 探测**。sub2api 会探测上游是否支持 Responses API。
-   代理对非 `chat/completions` 路径**纯净透传**，不做任何注入，让 sub2api
-   拿到 Cline Pass 的真实答复自行判断——不会因为代理的存在而误判协议。
-
-> 如果 sub2api 与代理都在容器里，把两者放进同一 Docker 网络，
-> 并把 `base_url` 指向 `http://cline-pin-proxy:8787/v1`。
-
----
-
-## 配置
-
-配置优先级：**环境变量 > 配置文件 > 内置默认值**。
-
-### 内置默认规则
-
-开箱即用（`contains` 匹配、`strict` 模式、双管道）。**规则按序匹配，具体在前**：
-
-| 命中 | 钉到 | 实测 TTFT |
-|---|---|---|
-| `*deepseek*` | `deepseek`（官方） | — |
-| `*glm-5.3-flash*` | `relace` | 0.72–0.97s（4/4 成功） |
-| `*glm-5.3*` | `friendli` | **0.31–0.35s（4/4 成功）** |
-
-⚠️ **GLM 刻意不钉官方渠道**：官方 `zai` / `z-ai` 实测首字延迟
-**2.0–3.1s / 1.8–2.2s**，而选中的两个第三方渠道快 **3–6 倍**。
-代价是可能落到量化（fp8/fp4）版本——这是知情的速度/质量取舍。
-
-⚠️ **两条 GLM 规则必须保持这个顺序，且不能合并成泛化的 `glm`**：
-两条管道的渠道池**不通用**（`glm-5.3` 走 planner、`glm-5.3-flash` 走 direct）。
-把一侧测通的 slug 搬到另一侧可能直接失败——实测 `glm-5.3-flash` 在 strict 下的
-`morph`/`novita`/`makora`/`baseten`/`modal` 等会报 `stream_initialization_failed`。
-**换 slug 前必须在对应模型上重新测速。**
-
-所有 slug 与延迟均来自真实网关实测，经 sub2api 全链路验收。
-完整数据见 **[docs/VERIFICATION.md](docs/VERIFICATION.md)**。
-
-### 配置文件
+For a test request, set `CLINE_KEY` to your Cline API key in your shell and run:
 
 ```bash
-cp config.example.json config.json      # Docker 部署则是 data/config.json
+curl -i http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CLINE_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":512}'
 ```
+
+## Provider routing
+
+Rules match the request's `model` value without requiring a particular namespace. The default `deepseek` rule matches both `cline-pass/deepseek-v4.1-flash` and `deepseek/deepseek-v4-flash`; the `glm-5.3-flash` rule also matches `z-ai/glm-5.3-flash`. The proxy preserves the model ID. These prefixes are part of the JSON value, not the HTTP path: all use `POST /v1/chat/completions`.
+
+Historical tests confirmed provider switching for `deepseek/deepseek-v4-flash`: selecting `deepseek` or `novita` returned `provider: "DeepSeek"` or `"Novita"`. `z-ai/glm-5.3-flash` also passed direct-pipeline probing and an integration request with `z-ai` injected. Some `cline-pass/` models ignored provider filters. See the [verification record](docs/VERIFICATION.md#1-模型管道与上游标识).
+
+Other model IDs can use custom rules. Effective provider selection requires account access to the model and gateway support for its routing fields; a model's presence in `/v1/models` alone does not establish that support.
+
+Cline uses two routing pipelines. Each accepts provider preferences in a different part of the request:
+
+| Pipeline | Backend | Routing fields | Response metadata |
+|---|---|---|---|
+| `planner` | Vercel AI Gateway | `providerOptions.gateway` | `choices[0].message.provider_metadata.gateway.routing` |
+| `direct` | OpenRouter | Top-level `provider` | `provider` |
+
+Cline determines the pipeline for each model. With `pipeline: "auto"`, the proxy writes both sets of fields. For example, a strict DeepSeek rule adds:
 
 ```json
 {
-  "listen": "127.0.0.1:8787",
-  "upstream": "https://api.cline.bot/api/v1",
-  "api_key": "",
-  "forward_headers": ["x-client-type"],
-  "probe_headers": { "x-client-type": "cline-cli" },
-  "max_body_bytes": 67108864,
-
-  "watch_seconds": 5,
-  "admin_token": "",
-  "admin_allow_unauthenticated": false,
-
-  "rules": [
-    {
-      "name": "deepseek-official",
-      "model": "deepseek",
-      "match": "contains",
-      "pipeline": "auto",
-      "mode": "strict",
-      "upstreams": ["deepseek"]
-    },
-    {
-      "name": "glm-5.3-flash",
-      "model": "glm-5.3-flash",
-      "match": "contains",
-      "pipeline": "auto",
-      "mode": "strict",
-      "upstreams": ["relace"]
-    },
-    {
-      "name": "glm-prefer-fast",
-      "model": "glm-5.3",
-      "match": "contains",
-      "pipeline": "auto",
-      "mode": "preferred",
-      "upstreams": ["friendli", "z-ai", "gmicloud"]
-    }
-  ]
+  "providerOptions": {"gateway": {"only": ["deepseek"]}},
+  "provider": {"only": ["deepseek"]}
 }
 ```
 
-⚠️ **一旦文件里出现 `rules`，内置默认规则表就被整体替换**（而不是合并）。
-所以示例里把三条都写全了。**不要把 `glm-5.3-flash` 和 `glm-5.3` 合并成一条
-泛化的 `glm`**：前者走 direct 管道、后者走 planner，两条管道的渠道池不通用，
-一条规则同时匹配两者时，总有一侧会被钉到它没有的渠道上。
-`rules: []` 是合法的——表示显式关闭钉死，全部交给 Cline Pass 自主路由。
+Some models ignore these fields. Successful injection does not guarantee that Cline used the requested provider. Check the upstream routing metadata when validating a rule; wrapped responses place that metadata under `data`.
 
-### 字段说明
+### Default rules
 
-**规则（`rules[]`）**
+Rules use case-insensitive substring matching. The first match wins.
 
-| 字段 | 取值 | 说明 |
+| Model substring, in order | Provider | Mode |
 |---|---|---|
-| `name` | 字符串 | 仅用于日志与排查 |
-| `model` | 字符串 | 用于比较的模式串 |
-| `match` | `contains` / `prefix` / `exact` | 匹配方式，默认 `contains`（大小写不敏感） |
-| `pipeline` | `auto` / `planner` / `direct` | 注入写在哪条管道，默认 `auto`（两条都写） |
-| `mode` | `strict` / `preferred` | `strict` 用 `only` 锁死唯一候选；`preferred` 用 `order` 按序尝试、允许回退 |
-| `upstreams` | 字符串数组 | 目标上游 slug。`strict` 只用第一个；`preferred` 需 ≥2 个 |
-| `sort` | `cost` / `ttft` / `tps` | 可选，要求网关按该指标排序候选 |
+| `deepseek` | `deepseek` | `strict` |
+| `glm-5.3-flash` | `relace` | `strict` |
+| `glm-5.3` | `friendli` | `strict` |
 
-**规则按数组顺序匹配，首个命中者生效。** 放具体的规则在前面，宽泛的放后面。
+Keep the flash rule before `glm-5.3`, which also matches flash model names. The two GLM models use different provider lists; a single broad `glm` rule can select an unsupported provider.
 
-**进程级**
+The GLM defaults were chosen from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency guarantees or quality comparisons. Third-party providers may use quantized models; the tests did not establish numerical precision or output quality.
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `listen` | `127.0.0.1:8787` | 监听地址。**只在启动时读取一次**，改它需要重启 |
-| `upstream` | `https://api.cline.bot/api/v1` | Cline Pass 基址 |
-| `api_key` | 空 | 固定上游密钥；留空则透传调用方的 `Authorization` |
-| `forward_headers` | `["x-client-type"]` | 白名单外额外透传给上游的请求头 |
-| `probe_headers` | `{"x-client-type":"cline-cli"}` | `probe` 子命令附带的请求头 |
-| `max_body_bytes` | 67108864 | 请求体上限 |
-| `watch_seconds` | `5` | 配置热重载轮询间隔；`0` 关闭热重载。**启动时读取一次** |
-| `admin_token` | 空 | 管理 API 令牌；留空且未开 `admin_allow_unauthenticated` 时管理 API 整体不可见 |
-| `admin_allow_unauthenticated` | `false` | 显式允许无令牌访问管理 API（仅限完全可信的本机环境） |
-| `unwrap_data_envelope` | `true` | 把非流式 JSON 响应里的 Cline `{data:{...}}` 包封还原成标准 OpenAI 形状 |
+Provider IDs, known filtering exceptions, and full measurements are recorded in [Verification notes (Chinese)](docs/VERIFICATION.md).
 
-`listen` 与 `watch_seconds` **只在启动时读取一次**（前者无法在不中断连接的前提下重新绑定，
-后者要改的是轮询循环本身）；**其余字段全部参与热重载**，包括 `admin_token` ——
-管理接口在每个请求上按当前配置判定，所以换令牌不需要重启。
+### Rule fields
 
-### 热重载
+| Field | Values and behavior |
+|---|---|
+| `name` | Label used in logs and response headers. Defaults to `rule-<index>`. |
+| `model` | Required model ID or substring to match. |
+| `match` | `contains` (default), `prefix`, or `exact`. All are case-insensitive. |
+| `pipeline` | `auto` (default) writes both pipelines; `planner` or `direct` writes only that pipeline. |
+| `mode` | `strict` (default) writes `only` with the first provider. `preferred` writes `order` and allows fallback. |
+| `upstreams` | Required provider ID array. `strict` uses only the first item; `preferred` requires at least two. |
+| `sort` | Optional: `cost`, `ttft`, or `tps`. On the direct pipeline these map to `price`, `latency`, and `throughput`. |
 
-改配置文件即生效，**不需要重启进程，也不需要重建容器**：
+On the selected pipelines, `strict` removes an existing `order`; `preferred` removes existing `only` and `allow_fallbacks` fields. Other provider options are preserved. `sort` replaces the caller's value only when configured. Adding `sort` to a strict rule does not enable fallback or remove `only`; rules cannot express sorting alone.
 
-```bash
-# 直接编辑挂载出来的文件（文件属主是容器用户时用 sudo tee，别用会改属主的编辑器）
-sudo vim data/config.json
-```
+A file's `rules` field replaces the entire default rule list. Use `"rules": []` to disable injection. See [config.example.json](config.example.json) for a complete configuration matching the defaults.
 
-进程按 `watch_seconds` 轮询文件修改时间，发现变化就重新解析并原子替换生效配置。
-日志会打出 `config reloaded`：
+## Response compatibility
+
+Cline has been observed returning non-streaming completions in this format:
 
 ```json
-{"level":"INFO","msg":"config reloaded","path":"/etc/cline-pin-proxy/config.json","rules":4}
+{"data":{"choices":[{"message":{"role":"assistant","content":"OK"}}]},"success":true}
 ```
 
-两个安全约定：
+Clients that expect top-level `choices` cannot read the completion. By default, the proxy returns the inner `data` object and sets `X-Cline-Pin-Unwrapped: data-envelope`.
 
-- **解析失败不会导致中断**。坏配置被拒绝，**上一份好配置继续生效**，同时打 WARN 日志。
-  同一个错误只告警一次（否则每 5 秒一条会在几分钟内刷满日志），文件修好后打一条
-  `config reload recovered` 并自动接管。
-- **文件被删除也不会中断**。配置回落到上次成功的值，等文件重新出现后再接管。
+Unwrapping applies only to responses with a JSON content type and all of these properties:
 
-> 为什么值得做这个：`docker compose up -d` 察觉不到挂载文件的内容变化，不会重建容器，
-> 改完配置毫无反应，是个很容易误判成「配置没写对」的坑。`restart` 其实能生效
-> （重新读一次文件），但要中断一次服务；对「换个 slug 试试速度」这种高频操作，
-> 热重载几乎是无成本的。真正**只有热重载能救**的场景，是下面这种环境变量遮蔽 ——
-> 见[环境变量与配置文件的优先级](#环境变量与配置文件的优先级)。
+- The top level has no `choices` field.
+- `data` is an object.
+- `data.choices` is a non-empty array.
 
-### 管理 API
+Other response bodies remain unchanged. JSON responses are buffered up to an 8 MiB limit, with one extra byte read to detect overflow. Larger responses are forwarded unchanged and marked `X-Cline-Pin-Unwrapped: skipped-too-large`. SSE (`text/event-stream`) responses are forwarded and flushed as chunks arrive, without JSON parsing or waiting for the complete response.
 
-用 `admin_token` 打开（或显式 `admin_allow_unauthenticated: true`）。
-**未配置令牌时整组路由返回 404**，不是 403 —— 不向扫描者暴露「这里有个管理面」。
+Set `"unwrap_data_envelope": false` to disable this conversion. The setting applies to JSON responses on all forwarded routes, independent of whether a provider rule matched.
 
-| 方法 | 路径 | 作用 |
+## Configuration
+
+Precedence is **non-empty environment variables > configuration file > defaults**. Whitespace-only environment values do not override the file. Command flags such as `serve -listen` and `probe -api-key` take precedence for that command.
+
+| JSON field | Default | Environment variable |
 |---|---|---|
-| `GET` | `/admin/config` | 查看当前生效配置（**自动隐去 `api_key` 与 `admin_token`**） |
-| `GET` | `/admin/rules` | 查看规则 |
-| `PUT` | `/admin/rules` | 替换规则：立即生效，并尽力写回配置文件 |
-| `POST` | `/admin/probe` | 探测某模型可用上游：`{"model":"...","pipeline":"auto"}` |
-| `POST` | `/admin/reload` | 强制重新读取配置文件 |
+| `listen` | `127.0.0.1:8787` | `CLINE_PIN_LISTEN` |
+| `upstream` | `https://api.cline.bot/api/v1` | `CLINE_PIN_UPSTREAM` |
+| `api_key` | Empty; forward client credentials | `CLINE_PIN_API_KEY` |
+| `forward_headers` | `["x-client-type"]` | `CLINE_PIN_FORWARD_HEADERS` |
+| `probe_headers` | `{"x-client-type":"cline-cli"}` | `CLINE_PIN_PROBE_HEADERS` |
+| `max_body_bytes` | `67108864` (64 MiB) | `CLINE_PIN_MAX_BODY_BYTES` |
+| `watch_seconds` | `5`; `0` disables polling | `CLINE_PIN_WATCH_SECONDS` |
+| `admin_token` | Empty; admin API disabled by default | `CLINE_PIN_ADMIN_TOKEN` |
+| `admin_allow_unauthenticated` | `false` | `CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED` |
+| `unwrap_data_envelope` | `true` | `CLINE_PIN_UNWRAP_DATA_ENVELOPE` |
+| `rules` | [Default rules](#default-rules) | `CLINE_PIN_RULES` |
 
-认证方式二选一：`Authorization: Bearer <token>` 或 `X-Admin-Token: <token>`。
+`CLINE_PIN_FORWARD_HEADERS` accepts comma-separated header names. `CLINE_PIN_PROBE_HEADERS` accepts comma-separated `name: value` pairs. `CLINE_PIN_RULES` accepts a JSON array. `CLINE_PIN_LOG_LEVEL` sets `debug`, `info`, `warn`, or `error` and has no JSON equivalent.
 
-```bash
-TOKEN=$(python3 -c 'import json;print(json.load(open("data/config.json"))["admin_token"])')
+`upstream` must be an HTTP(S) URL with a host and no query or fragment. Configuration must be a JSON object; `null` is not valid. Invalid rule JSON and invalid numeric or boolean environment values are rejected by the normal configuration loader. The missing-file startup exception is recorded under [known implementation limits](docs/CODE_REVIEW.md#current-implementation-limits).
 
-# 看看现在钉的是什么
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/rules | jq
+### Reloading
 
-# 热更新规则（不需要重启）。裸数组和 {"rules":[...]} 两种写法都收。
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
-     -H 'Content-Type: application/json' \
-     -d '[{"name":"glm","model":"glm-5.3","match":"contains","mode":"strict","upstreams":["friendli"]}]' \
-     http://127.0.0.1:8787/admin/rules
-# {"ok":true,"applied":true,"persisted":true,"rules":[{"name":"glm",...}]}
-# 「规则」字段是生效后的完整规则数组，不是数量。
+The server checks the file's modification time at the configured interval. A valid update replaces the active configuration. An invalid or missing file leaves the last valid configuration active; repeated identical errors are logged once, followed by a recovery message when loading succeeds.
 
-# 加个新模型前先看看有哪些渠道
-curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{"model":"cline-pass/glm-5.3"}' http://127.0.0.1:8787/admin/probe | jq
-```
+`listen`, `watch_seconds`, and the log level take effect at startup. Other configuration fields can reload, including the admin token. The Docker image sets `CLINE_PIN_LISTEN=0.0.0.0:8787` so that port publishing works; this overrides the example file's loopback address inside the container.
 
-`PUT /admin/rules` 的响应字段：
+Environment overrides still apply after reload. To manage a field through the file, remove its non-empty environment override. A container's environment changes only when it is recreated. Restarting a process rereads its file, but `docker compose up -d` alone does not restart a container merely because a mounted file changed.
 
-- `applied` —— 是否已在本进程生效（只要规则合法就是 `true`，与落盘无关）。
-- `persisted` —— 是否成功写回配置文件。**写回失败不影响生效**，
-  响应会同时给出 `persist_error` 与 `hint`，规则最迟在下一次重启后消失。
+When `serve -config` names a missing file, the server starts with defaults and environment settings and watches for the file to appear. An existing invalid file prevents startup. The `check` and `probe` commands require an explicitly named file to exist.
 
-> **Docker 下写回失败是正常现象，不是 bug**。容器以 nonroot（uid 65532）运行，
-> 而 compose 建出来的 `./data` 属于 root，原子替换需要**目录**可写。
-> 代理会自动退化为原地覆盖并打 WARN；若宿主目录同样不可写，就只生效不落盘。
-> 想让它落盘：`sudo chown -R 65532:65532 data`。
-> 也可以干脆不用 API —— 直接编辑 `data/config.json`，热重载等价且更可审计。
+### Admin API
 
-### 环境变量
+Set `admin_token` to enable these endpoints. Authenticate with `Authorization: Bearer <token>` or `X-Admin-Token: <token>`.
 
-| 变量 | 说明 |
-|---|---|
-| `CLINE_PIN_LISTEN` | 监听地址，默认 `127.0.0.1:8787` |
-| `CLINE_PIN_UPSTREAM` | Cline Pass 基址，默认 `https://api.cline.bot/api/v1` |
-| `CLINE_PIN_API_KEY` | 固定上游密钥；留空则透传调用方的 `Authorization` |
-| `CLINE_PIN_FORWARD_HEADERS` | 额外透传的请求头，逗号分隔 |
-| `CLINE_PIN_PROBE_HEADERS` | `probe` 附带的请求头，`name: value` 逗号分隔 |
-| `CLINE_PIN_MAX_BODY_BYTES` | 请求体上限，默认 64 MiB |
-| `CLINE_PIN_RULES` | 规则表 JSON，整体覆盖配置文件 |
-| `CLINE_PIN_WATCH_SECONDS` | 热重载轮询间隔秒数；`0` 关闭 |
-| `CLINE_PIN_ADMIN_TOKEN` | 管理 API 令牌 |
-| `CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED` | `true` 时允许无令牌访问管理 API |
-| `CLINE_PIN_UNWRAP_DATA_ENVELOPE` | `false` 时关闭 Cline `data` 包封还原 |
-| `CLINE_PIN_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
-
-> 配置里的 `api_key`、`admin_token` 属敏感字段，**环境变量的值不会被写回配置文件** ——
-> 通过 `PUT /admin/rules` 落盘时只替换 `rules` 键，其余内容原样保留。
-
-### 环境变量与配置文件的优先级
-
-**环境变量 > 配置文件 > 内置默认值**。这条规则的副作用值得单独说清楚：
-
-> 只要环境变量**非空**，它就赢，配置文件里同名字段改什么都不会生效 ——
-> 热重载也一样，因为热重载只重新读文件，然后又被环境变量盖回去。
-
-空字符串（或纯空白）等同于"没设置"，不参与覆盖。所以想让配置文件说了算，
-就不要给那个变量赋值。
-
-Docker 部署尤其要注意这点：compose 里写 `${VAR:-某个默认值}` 会**无条件**把
-默认值注入容器，于是配置文件里的 `upstream` / `forward_headers` 永远被遮蔽。
-本项目的 `docker-compose.yml` 因此统一用空默认值 `${VAR:-}`，把默认值留给应用本身。
-
-**显式给出的非法值会让启动失败**，不会被静默忽略：把 `CLINE_PIN_RULES='[{bad'`
-当成"没配置"，会让运维者以为规则表已经覆盖了，实际继续走默认渠道。
-
----
-
-## 探测上游
-
-不知道某个模型背后有哪些渠道可用？不需要抓包，也不需要真的消耗 token：
-
-```bash
-cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
-```
-
-输出：
-
-```
-模型      : cline-pass/deepseek-v4.1-flash
-上游状态码: 404
-管道      : direct
-可用上游  : 4 个
-   1. deepseek
-   2. novita
-   3. baseten
-   4. gmicloud
-
-可直接粘贴进 config.json 的 rules（默认钉第一个上游，可按需改）：
-[ { "name": "pin-cline-pass-deepseek-v4-1-flash", ... } ]
-```
-
-**原理**：给请求注入一个绝不存在的上游名（`__probe__`），网关会在路由层直接失败。
-因为不存在任何可用候选，这次请求走不到推理后端，**基本不消耗 token**，
-而错误信息里会带上它当前可用的完整渠道清单。
-
-严格说这**不是无条件免费**：它依赖"网关在路由层就拦下"。对会执行该过滤器的模型，
-请求根本到不了推理后端（不产生 token）；但实测也发现过个别模型忽略过滤器、
-照常返回正文的情况（见 [docs/VERIFICATION.md](docs/VERIFICATION.md) 第二节），
-那种情况会正常计费。想完全确定，先看返回里有没有可用清单。
-
-两条管道的错误格式不同，代理会分别解析；`-pipeline` 可强制指定以排查管道归属。
-
-### 两个必须知道的局限
-
-**① 清单不保证穷尽。** 实测 `deepseek/deepseek-v4-flash` 的清单列了 26 个上游、
-**不含 `deepseek`**，但钉到 `deepseek` 却成功。要确认某个 slug 真的可用，
-必须发一次钉住它的真实请求，再读响应里的 `finalProvider` / `provider`。
-
-**② 部分模型要求调用方身份头。** `deepseek/...` 这类规范名缺少
-`x-client-type: cline-cli` 会直接 403 —— 这会让探测得出与线上相反的结论。
-`probe` 默认已带上该头（可用 `probe_headers` 配置或 `-H` 覆盖）：
-
-```bash
-cline-pin-proxy probe -model deepseek/deepseek-v4-flash -H "x-client-type: cline-cli"
-```
-
-### 校验配置
-
-```bash
-cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
-```
-
----
-
-## 观测
-
-### 响应头
-
-每个响应都会带上这次决策的结果：
-
-| 响应头 | 含义 |
-|---|---|
-| `X-Cline-Pin-Rule` | 命中的规则名；`none` 表示未钉死 |
-| `X-Cline-Pin-Upstreams` | 本次钉住的目标，多个用 `>` 连接 |
-| `X-Cline-Pin-Mode` | `strict` / `preferred` |
-| `X-Cline-Pin-Note` | **仅在未钉死时出现**，说明原因（无规则命中 / 注入失败） |
-| `X-Cline-Pin-Unwrapped` | `data-envelope` 表示还原了 Cline 包封；`skipped-too-large` 表示响应过大未还原 |
-
-上游自己的路由元数据头（`x-*`）也会原样透传，包括 `X-Cline-Actual-Upstream`
-之类的字段——**这就是「抓包确认 finalProvider」的替代品**。
-
-### 日志
-
-```json
-{"level":"INFO","msg":"pinned request","model":"cline-pass/deepseek-v4.1-flash",
- "rule":"deepseek","upstreams":"deepseek","mode":"strict","pipeline":"auto"}
-```
-
----
-
-## 行为约定
-
-这些是刻意设计的，改动前请先想清楚：
-
-- **只注入 `POST /v1/chat/completions`**（含 `/chat/completions`、`/api/v1/chat/completions`
-  三种写法，都会归一化成上游基址下的同一路径）。
-  其余端点纯净透传——调用方靠它们探测上游能力，代理不该干扰结论。
-- **未命中规则时完全原样转发**，由 Cline Pass 自主路由。不会偷偷钉任何东西。
-- **注入失败时降级为未钉死透传**，并在 `X-Cline-Pin-Note` 里注明，避免"以为钉住了"。
-- **上游状态码与响应体原样回传**，调用方的故障转移逻辑才不会失灵。
-  因此**不跟随重定向**：30x 连同 `Location` 原样返回，而不是替调用方把 302 跟成 200。
-  **唯一的例外**是下一条（响应体改写），它只针对一个精确形状，详见
-  [Cline 响应包封](#它还顺手堵上了-cline-的响应包封缝隙)。
-- **非流式 JSON 响应里的 Cline `data` 包封会被还原**成标准 OpenAI 形状，
-  并打上 `X-Cline-Pin-Unwrapped: data-envelope`（超 8 MiB 未还原时打
-  `skipped-too-large`）。**流式响应一个字都不会被缓冲或改写。**
-  开关：`unwrap_data_envelope`（默认 `true`）。
-- **上游中途断开时主动断连**。响应头一旦发出就无法再改成 5xx，如果只是安静返回，
-  下游会把残缺内容当成"正常结束"（`Content-Length` 不透传，HTTP 层没有失败信号）。
-  代理会以 `http.ErrAbortHandler` 断开连接，客户端因此拿到 `unexpected EOF`。
-- **流式响应逐块 Flush**，全程 O(1) 内存，不做任何 JSON 解析。
-  这是首字延迟不退化的前提。
-- **不设 `http.Client.Timeout`**：流式生成可能持续数分钟，整体超时会把长回答砍断。
-  超时改由 dial / TLS / 响应头三段分别控制。
-- 注入采用「解析 → 深度合并 → 重新编码」，数字用 `json.Number` 承载、
-  且关闭 HTML 转义，保证除注入字段外请求体语义完全不变（含大整数精度与 `< > &` 原样保留）。
-- **代理是路由字段的唯一决定者**。在它写入的那条管道上，`only` / `order` /
-  `allow_fallbacks` / `sort` 以配置为准：`preferred` 会清掉调用方自带的 `only`
-  与 `allow_fallbacks=false`，否则多候选会静默退化成"只用第一个"。
-  其它字段（包括 `require_parameters`、`data_collection` 等）一律不动。
-- **一次请求只用一份配置快照**。热重载在请求处理中途生效也不会让这次请求
-  混用新旧配置（旧上游 + 新密钥）。
-
----
-
-## 安全
-
-- 默认**只监听 `127.0.0.1`**。代理通常与调用方同机，不需要对外暴露。
-  容器内需监听 `0.0.0.0`，但 `docker-compose.yml` 把宿主机端口绑定限制在回环。
-- 请求头**白名单透传**，白名单外的一律不外泄到上游。
-- 响应头同样白名单，且刻意不转发 `Content-Length`（注入会改变长度）。
-- 路径白名单限制在 `/v1/` 与 `/api/v1/`，**并拒绝任何百分号转义与点段**：
-  `/v1/%2e%2e/%2e%2e/admin` 这类编码穿越在 Go 1.22+ 上不会被 ServeMux 规范化，
-  拿去拼上游 URL 就能跳出 API 前缀。支持的 OpenAI 端点路径不含需要转义的字符，
-  所以直接拒绝比猜测安全。
-- 请求体有大小上限，超限返回 413 而不是把内存读满；**透传端点同样执行**
-  （已知长度直接拒，chunked 靠 `MaxBytesReader` 在读取中拦截）。
-- **管理 API 默认整体关闭**（未设 `admin_token` 时返回 404 而非 403），
-  令牌比较用 `crypto/subtle` 常量时间实现；`GET /admin/config` 会隐去
-  `api_key` 与 `admin_token`，避免把密钥回显给调用方。
-- 写回配置**只在确认"原子替换做不到"**（目录不可写、只读挂载）时才退化为
-  原地覆盖。磁盘满、I/O 错误这类内容写失败会直接报错，不会去截断唯一的配置文件。
-- 配置里的 `api_key` 是明文。别把 `config.json` / `data/` 提交进 git（`.gitignore` 已排除）。
-
----
-
-## 开发
-
-```bash
-go test ./...              # 全部单测
-go test -race ./...        # 需要 cgo（例如 Linux CI）
-go vet ./...
-gofmt -l .                 # 应为空
-go test -cover ./...
-bash scripts/linux-check.sh # 在 Linux 容器里跑一遍（需要 Docker）
-```
-
-> **为什么要有 `linux-check.sh`**：本项目在 Windows 上开发、在 Linux 上发布，
-> 差异会直接导致编译失败。真实踩过：Linux 上 `syscall.ENOTSUP` 与
-> `syscall.EOPNOTSUPP` 是同一个常量，`switch` 里同时列出就是重复 case，
-> 编译不过；Windows 上两者是不同值，本地一路绿灯直到 CI 才炸。
-
-覆盖率：`pin` 94.5% / `admin` 94.9% / `probe` 92.0% / `config` 88.6% / `proxy` 84.7% / `cmd` 22.6%
-（`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支；
-`cmd` 只覆盖了子命令分发与 `check`/`healthcheck`，`serve` 的启动路径要真实起服务，未纳入）。
-
-CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；
-`Release` 工作流**自己也带一道同样的验证门禁**（单测没过就不会推镜像），
-通过后构建 `linux/amd64`、`linux/arm64` 多架构镜像推到 GHCR，
-打 tag 时额外附带 5 个平台的裸二进制。
-
----
-
-## 与同类项目的关系
-
-| 项目 | 形态 | 与本项目的关系 |
+| Method | Path | Behavior |
 |---|---|---|
-| [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher) | Node 代理 + 控制台 | 功能全（账号池、测速、校验），零依赖。**想开箱即用、要 UI 就选它** |
-| [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) | CLIProxyAPI 插件（Go） | 需要 CPA 进程；双管道注入设计一致 |
-| **本项目** | 单文件 Go 代理 | **只做两件事**：钉死上游 + 还原 Cline 的响应包封。无账号池、无 UI、无状态，约 5 MB 镜像 |
+| `GET` | `/admin/config` | Read the loaded configuration, omitting `api_key` and `admin_token`. |
+| `GET` | `/admin/rules` | Read `{"rules":[...]}`. |
+| `PUT` | `/admin/rules` | Replace rules in memory and attempt to save them to the file. |
+| `POST` | `/admin/probe` | Probe with `{"model":"...","pipeline":"auto"}`. |
+| `POST` | `/admin/reload` | Reload the file immediately. |
 
-> 就目前所见，**响应包封还原这一步没有同类项目做过**。它很容易被当成"上游偶尔抽风"
-> 而放过——因为只影响客户端读不读得到内容，不影响计费，上游网关没有动力修。
+Without a token, these routes return 404 unless `admin_allow_unauthenticated` is explicitly enabled. When a token is set, missing or incorrect credentials return 401 even if that flag is enabled. Allow unauthenticated access only in a trusted environment.
 
-本项目的双管道知识来自上述项目的公开实测记录，**未复制其源代码**。
-详见 [NOTICE](NOTICE)。
+For shell examples below, set `ADMIN_TOKEN` to the configured admin token:
 
----
+```bash
+curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://127.0.0.1:8787/admin/rules
+
+# Save, edit, and submit the complete rule list.
+curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://127.0.0.1:8787/admin/rules > rules.json
+# Edit rules.json before running the next command.
+curl -fsS -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' --data-binary @rules.json \
+  http://127.0.0.1:8787/admin/rules
+```
+
+`PUT` accepts a bare array or `{"rules":[...]}`. It rejects `null`, null elements, unknown rule fields, and trailing data. Only `[]` explicitly clears the list.
+
+A successful response includes `applied`, `persisted`, and the current `rules` array. If saving fails, it also includes `persist_error` and `hint`. Unsaved rules can be replaced by a later reload or lost on restart. `CLINE_PIN_RULES` continues to override file rules after loading; remove that override before managing rules through the API and inspect the returned array.
+
+Saving changes only the `rules` value, preserves other JSON values and existing file permission bits, and does not copy environment secrets into the file. Atomic replacement requires a writable directory. The service runs as UID/GID 65532 in Docker; on Linux, `sudo chown -R 65532:65532 data` grants it ownership of the mounted directory. If atomic replacement is unavailable, the proxy may write in place and logs a warning. In-place writes are not atomic. Disk-full and I/O errors do not trigger that fallback.
+
+`POST /admin/probe` uses the configured upstream key and probe headers. The admin token is not an upstream credential.
+
+## Probe and validate
+
+With `CLINE_PIN_API_KEY` set, inspect providers reported by the gateway:
+
+```bash
+./cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
+./cline-pin-proxy probe -model deepseek/deepseek-v4-flash -H 'x-client-type: cline-cli'
+```
+
+The probe injects `only: ["__probe__"]` and parses the routing error. Models that honor the filter reject the request before inference. Models that ignore it may generate a response and incur charges. The returned provider list can be incomplete, and a listed provider can still fail a real request.
+
+Use `-pipeline planner` or `-pipeline direct` to restrict injection. Probe requests include `x-client-type: cline-cli` by default; some models return 403 without it. A probe prints a suggested exact-match rule, selecting the first reported provider. Review that choice before using it; replacing `rules` also replaces all existing rules.
+
+Validate configuration and preview a match without contacting Cline:
+
+```bash
+./cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
+```
+
+Run `./cline-pin-proxy help` for commands and `./cline-pin-proxy <command> -h` for flags. CLI messages are currently in Chinese.
+
+## sub2api integration
+
+For a Cline Pass account configured as an OpenAI-compatible API-key account in sub2api, change its base URL from `https://api.cline.bot/api/v1` to the proxy's `/v1` URL.
+
+- If both services run in containers, connect them to a shared Docker network and use `http://cline-pin-proxy:8787/v1`. A container's `127.0.0.1` refers to itself.
+- Keep the Cline Pass key on the account unless the proxy has a fixed upstream key.
+- If the account sets `x-client-type: cline-cli`, the default proxy configuration forwards it. Normal proxy requests do not add that header themselves.
+- Requests to `/v1/responses` and other supported paths are forwarded without provider injection, allowing sub2api to check upstream protocol support.
+
+## Diagnostics
+
+| Header | Meaning |
+|---|---|
+| `X-Cline-Pin-Rule` | Rule applied to a chat completion request; `none` if no rule was applied. |
+| `X-Cline-Pin-Upstreams` | Configured provider list, joined with `>`. A strict rule still uses only the first entry. |
+| `X-Cline-Pin-Mode` | `strict` or `preferred`. |
+| `X-Cline-Pin-Note` | Why injection was skipped: no match, unreadable model, or injection failure. |
+| `X-Cline-Pin-Unwrapped` | `data-envelope` when converted; `skipped-too-large` when over the buffer limit. |
+
+Pinning headers report proxy decisions, not the provider Cline actually used. They are not added to ordinary passthrough routes. Upstream `x-*` headers are forwarded when present; the proxy does not generate an actual-provider header.
+
+Logs use Go's `slog` text format on stderr. A pinned request includes `model`, `rule`, `upstreams`, `mode`, and `pipeline`:
+
+```text
+level=INFO msg="pinned request" model=cline-pass/deepseek-v4.1-flash rule=deepseek upstreams=deepseek mode=strict pipeline=auto
+```
+
+If a non-streaming completion appears empty, check `X-Cline-Pin-Unwrapped` and the response's `choices` location. Also allow enough output tokens: a recorded test with `max_tokens: 24` produced `empty response content` errors on five of six reasoning models; all six succeeded with 512. This is separate from response wrapping.
+
+## Behavior and security
+
+- Provider fields are injected only for `POST /v1/chat/completions`, `/chat/completions`, and `/api/v1/chat/completions`. Other requests under `/v1/` and `/api/v1/` are forwarded without request-body rewriting. `OPTIONS` is handled locally.
+- Unmatched or unparseable chat requests retain their original body. Injection failures also fall back to the original body and are marked in the response headers.
+- Upstream status codes are preserved. Redirects are returned with `Location` and are not followed. Response bodies are preserved except for the JSON envelope conversion described above; HTTP framing and compression may be handled by Go's transport.
+- SSE is copied with a fixed-size buffer and flushed after each read. The proxy has no overall HTTP client timeout; dial and TLS timeouts are 10 seconds each, and the response-header timeout is 120 seconds.
+- The normal streaming path aborts the downstream connection if the upstream body ends with a read error. Buffered JSON reads do the same. The oversized JSON fallback has a separate [known limitation](docs/CODE_REVIEW.md#current-implementation-limits).
+- Each forwarded request uses one configuration snapshot. Injection preserves JSON number precision and does not HTML-escape `<`, `>`, or `&`.
+- Request bodies are limited to 64 MiB by default, including on passthrough routes. Over-limit reads return 413; unknown-length bodies may already have been partially sent upstream.
+- API paths are validated before forwarding. Encoded paths and traversal segments are rejected by the proxy path validator. Requests outside supported routes return 404.
+- Request headers are limited to `Content-Type`, `Accept`, `Authorization`, `User-Agent`, and `forward_headers`. Response headers are limited to `Content-Type`, `Content-Encoding`, `Cache-Control`, `Retry-After`, `Location`, and `x-*`; upstream `Content-Length` is not copied. Buffered JSON responses get a computed length.
+- The default listener and Compose host port use loopback. Public API routes have no separate client authentication. Protect access with network controls or an authenticated reverse proxy if exposing them beyond trusted clients.
+- Keys stored in configuration files are plaintext. `config.json` and `data/` are git-ignored. `/admin/config` omits the two key fields but returns `probe_headers`; do not treat it as a general secret-redaction endpoint.
+
+## Development and project notes
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the source layout, checks, and release workflow. Historical gateway tests are in [docs/VERIFICATION.md](docs/VERIFICATION.md); the review baseline, fixes, and current limitations are in [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md). These detailed records are in Chinese.
+
+Routing knowledge came from public records in [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher), [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway), and [dsh-cline-pass](https://github.com/yhshzh/dsh-cline-pass). No source code was copied from those projects. See [NOTICE](NOTICE).
+
+The project focuses on provider routing and response compatibility. It does not include an account pool or web UI.
 
 ## License
 
-[MIT](LICENSE) —— 可自由使用、修改、商用，仅需保留版权声明。
+[MIT](LICENSE).

@@ -1,13 +1,6 @@
-// Command cline-pin-proxy 是一个把 Cline Pass 的上游渠道钉死的透传代理。
-//
-// 它解决一个很具体的问题：Cline Pass 订阅模型背后有多个推理上游（deepseek、
-// z-ai、baseten、novita……），由 Cline 网关自行调度，客户端无法控制实际走哪家。
-// 而这个网关内部有两条互不相同的分流管道，钉死写法完全不同：
-//
-//	planner（Vercel AI Gateway）：只认 providerOptions.gateway.{only,order,sort}
-//	direct （OpenRouter）        ：只认顶层 provider.{only,order,sort}
-//
-// 本代理在请求进入 Cline Pass 之前把两份写法都注入进去，让每条管道各取所需。
+// Command cline-pin-proxy 提供 Cline API 上游路由与响应格式兼容代理。
+// 默认同时注入 planner 和 direct 两条管道的上游设置，
+// 并将符合条件的非流式 data 包装转换为标准 OpenAI 响应。
 //
 // 用法：
 //
@@ -84,11 +77,11 @@ func run(args []string) error {
 }
 
 func usage() {
-	fmt.Print(`cline-pin-proxy - 钉死 Cline Pass 的上游渠道
+	fmt.Print(`cline-pin-proxy - Cline API 上游路由与响应格式兼容代理
 
 子命令:
   serve        启动透传代理（默认）
-  probe        探测某个模型背后真实可用的上游渠道（零 token 开销）
+  probe        从网关路由错误中读取上游列表（可能产生推理费用）
   check        校验配置并预览规则匹配结果
   healthcheck  探测本地 /healthz，供容器 HEALTHCHECK 使用
   version      打印版本
@@ -102,7 +95,7 @@ func usage() {
 
 环境变量:
   CLINE_PIN_LISTEN             监听地址
-  CLINE_PIN_UPSTREAM           Cline Pass 基址
+  CLINE_PIN_UPSTREAM           Cline API 基址
   CLINE_PIN_API_KEY            固定上游 API Key（为空则透传客户端凭据）
   CLINE_PIN_FORWARD_HEADERS    额外透传的请求头，逗号分隔
   CLINE_PIN_PROBE_HEADERS      probe 附带的请求头，"name: value" 逗号分隔
@@ -110,10 +103,11 @@ func usage() {
   CLINE_PIN_WATCH_SECONDS      配置文件热重载间隔（0 关闭）
   CLINE_PIN_ADMIN_TOKEN        管理 API 令牌（设置后启用 /admin/*）
   CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED  未设令牌时也启用管理 API
-  CLINE_PIN_RULES              规则表 JSON，覆盖配置文件
+  CLINE_PIN_RULES              规则表 JSON，整体替换配置文件中的规则
+  CLINE_PIN_UNWRAP_DATA_ENVELOPE  是否还原非流式 data 包装（默认 true）
   CLINE_PIN_LOG_LEVEL          日志级别 debug|info|warn|error
 
-管理 API（需配置 admin_token，否则返回 404）:
+管理 API（默认关闭；设置 admin_token 或显式允许匿名访问后启用）:
   GET  /admin/config   查看当前生效配置（密钥不下发）
   GET  /admin/rules    查看规则
   PUT  /admin/rules    整体替换规则，立即生效并尽力写回配置文件
@@ -296,9 +290,8 @@ func runProbe(args []string) error {
 	for i, u := range res.Upstreams {
 		fmt.Printf("  %2d. %s\n", i+1, u)
 	}
-	fmt.Printf("\n注意：该清单来自路由层的错误信息，**不保证穷尽**——实测有好用的上游\n" +
-		"      并不出现在这份清单里。要确认某个 slug 是否真的可用，直接发一次\n" +
-		"      钉住它的真实请求、再看响应里的 finalProvider / provider 字段。\n")
+	fmt.Printf("\n列表可能不完整，列出的上游也可能请求失败。\n" +
+		"请发送指定上游的真实请求，并检查 finalProvider / provider 确认实际路由。\n")
 
 	rule := config.Rule{
 		Name:      "pin-" + sanitizeName(res.Model),
@@ -310,7 +303,7 @@ func runProbe(args []string) error {
 	}
 	suggested, err := json.MarshalIndent([]config.Rule{rule}, "", "  ")
 	if err == nil {
-		fmt.Printf("\n可直接粘贴进 config.json 的 rules（默认钉第一个上游，可按需改）：\n%s\n", suggested)
+		fmt.Printf("\n建议规则（选择列表第一项，请验证后使用；替换 rules 会覆盖全部已有规则）：\n%s\n", suggested)
 	}
 	return nil
 }
@@ -358,7 +351,7 @@ func runCheck(args []string) error {
 			fmt.Printf("\n模型 %q 命中规则 %q → 钉到 %s（%s）\n",
 				m, r.Name, strings.Join(r.Upstreams, ">"), r.Mode)
 		} else {
-			fmt.Printf("\n模型 %q 未命中任何规则 → 将纯净透传，由 Cline Pass 自主路由\n", m)
+			fmt.Printf("\n模型 %q 未命中任何规则 → 保留原始请求体，由上游网关路由\n", m)
 		}
 	}
 	return nil

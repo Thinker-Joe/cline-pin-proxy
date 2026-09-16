@@ -1,7 +1,6 @@
 // Package config 定义 cline-pin-proxy 的配置模型、默认值、校验与环境变量覆盖。
 //
-// 设计原则：零第三方依赖。配置文件用 JSON，避免为 YAML 引入模块依赖，
-// 这样 Docker 镜像可以在完全离线的环境里构建。
+// 配置使用 JSON，由标准库解析，无需第三方模块。
 package config
 
 import (
@@ -39,7 +38,7 @@ const (
 
 // Pipeline 决定上游偏好写在哪条管道上。
 //
-// Cline Pass 后面存在两条互不相同的分流管道，钉死写法不同：
+// Cline API 使用两条路由管道，各自读取不同的上游设置：
 //   - planner：Vercel AI Gateway，只认 providerOptions.gateway.*
 //   - direct：OpenRouter，只认顶层 provider.*
 //
@@ -76,7 +75,7 @@ type Rule struct {
 type Config struct {
 	// Listen 是监听地址。默认只绑定回环，避免把代理暴露到公网。
 	Listen string `json:"listen"`
-	// Upstream 是 Cline Pass 网关的 OpenAI 兼容基址。
+	// Upstream 是 Cline 网关的 OpenAI 兼容基址。
 	Upstream string `json:"upstream"`
 	// APIKey 非空时用它覆盖客户端传来的 Authorization；为空则透传客户端凭据。
 	APIKey string `json:"api_key"`
@@ -91,25 +90,15 @@ type Config struct {
 	// MaxBodyBytes 是允许读取的最大请求体字节数。
 	MaxBodyBytes int64 `json:"max_body_bytes"`
 	// WatchSeconds 是配置文件热重载的轮询间隔（秒）。0 表示关闭热重载。
-	//
-	// 有了它，改配置不再需要重建容器——这一点在 Docker 下尤其重要，因为
-	// config.json 是挂载文件，`docker compose up -d` 察觉不到内容变化，
-	// 而配置只在进程启动时读取。
+	// 轮询间隔在启动时读取，修改它需要重启。
 	WatchSeconds int `json:"watch_seconds"`
 	// AdminToken 非空时启用管理 API（/admin/*），并要求携带该令牌。
 	AdminToken string `json:"admin_token"`
 	// AdminAllowUnauthenticated 在未设置 token 时也启用管理 API。
 	// 仅在只绑回环、且确定没有其它本机进程会访问时开启。
 	AdminAllowUnauthenticated bool `json:"admin_allow_unauthenticated"`
-	// UnwrapDataEnvelope 把 Cline API 的非标准响应包封还原成标准 OpenAI 形状。
-	//
-	// Cline 会把整个补全包在 data 里：{"data":{...标准补全...},"success":true}。
-	// 而绝大多数 OpenAI 客户端（含 sub2api 之后的各类适配器）只读顶层 choices，
-	// 于是拿到一个"成功但没有 choices"的响应。实测只有**非流式**响应会这样，
-	// 流式 SSE 的事件是标准的。
-	//
-	// 代理已经在这条链路上，把这一步做掉可以让任何客户端都拿到正常响应，
-	// 而不必指望每个下游都自己兼容 Cline 的怪癖。
+	// UnwrapDataEnvelope 将符合条件的 JSON 响应中的 data 对象作为响应体，
+	// 使只读取顶层 choices 的客户端能够解析 Cline 补全。SSE 不做此转换。
 	UnwrapDataEnvelope bool `json:"unwrap_data_envelope"`
 	// Rules 是钉死规则表。
 	Rules []Rule `json:"rules"`
@@ -118,7 +107,7 @@ type Config struct {
 // DefaultListen 只绑回环：代理通常与调用方同机，无需对外暴露。
 const DefaultListen = "127.0.0.1:8787"
 
-// DefaultUpstream 是 Cline Pass 的官方 OpenAI 兼容入口。
+// DefaultUpstream 是 Cline API 的 OpenAI 兼容入口。
 const DefaultUpstream = "https://api.cline.bot/api/v1"
 
 // DefaultMaxBodyBytes 允许多轮长上下文请求。
@@ -127,33 +116,22 @@ const DefaultMaxBodyBytes int64 = 64 << 20 // 64 MiB
 // DefaultWatchSeconds 是配置文件热重载的默认轮询间隔。
 const DefaultWatchSeconds = 5
 
-// Default 返回内置默认配置，其中包含针对 DeepSeek 与 GLM 的钉死规则。
+// Default 返回包含 DeepSeek 与 GLM 规则的默认配置。
+// 上游选择依据为 docs/VERIFICATION.md 中 2026-09-16 的实测：
 //
-// 这些规则是 2026-09-16 在真实网关上逐模型探测 + 逐个测速后确定的，不是猜的。
+//	glm-5.3-flash → relace   首字节延迟 0.72–0.97s，4/4 成功
+//	glm-5.3       → friendli 首字节延迟 0.31–0.35s，4/4 成功
 //
-// GLM 侧刻意**不钉官方渠道**：实测官方 `zai`/`z-ai` 的首字延迟是
-// 2.0–3.1s / 1.8–2.2s，而下面两个第三方渠道快 3–6 倍。代价是可能落到
-// 量化（fp8/fp4）版本，属于知情取舍。
-//
-//	glm-5.3       → friendli   实测 TTFT 0.31–0.35s（4/4 成功，最稳定）
-//	glm-5.3-flash → relace     实测 TTFT 0.72–0.97s（4/4 成功，最稳定）
-//
-// 注意两条 GLM 规则**必须**保持这个顺序，且不能合并成一条泛化的 `glm`：
-//
-//	cline-pass/glm-5.3-flash 走 direct 管道，渠道池含 relace / z-ai / parasail …
-//	cline-pass/glm-5.3       走 planner 管道，渠道池含 friendli / togetherai / zai …
-//
-// 两条管道的渠道池**不通用**：把在一侧测通的 slug 搬到另一侧可能直接失败
-// （实测 glm-5.3-flash 的 morph/novita/makora/baseten/modal 等在 strict 下报
-// stream_initialization_failed）。换 slug 前必须在对应模型上重新测速。
+// flash 规则必须在前，因为 glm-5.3 也能匹配 flash 模型名。
+// 两个模型使用不同管道，上游列表和表现不能互相推导，不得合并成宽泛的 glm 规则。
+// 修改上游前应对具体模型重新测试；原测试未确认量化方式或输出质量。
 func Default() *Config {
 	return &Config{
 		Listen:       DefaultListen,
 		Upstream:     DefaultUpstream,
 		MaxBodyBytes: DefaultMaxBodyBytes,
 		WatchSeconds: DefaultWatchSeconds,
-		// Cline 的非标准包封默认还原：客户端只读顶层 choices，不还原就等于
-		// 给下游塞一个"成功但没内容"的响应。要原样透传可显式关掉。
+		// 默认转换 data 包装，可显式关闭以保留原始响应体。
 		UnwrapDataEnvelope: true,
 		// Cline 网关会用这个头区分调用方，上游侧常见配置依赖它，因此默认透传。
 		ForwardHeaders: []string{"x-client-type"},
@@ -531,7 +509,7 @@ func (c *Config) Match(model string) (Rule, bool) {
 	return Rule{}, false
 }
 
-// Matches 报告规则是否命中给定模型 ID。
+// Matches 报告规则是否命中给定模型 ID，不要求 cline-pass/ 或其他命名空间前缀。
 func (r Rule) Matches(model string) bool {
 	key := strings.ToLower(strings.TrimSpace(r.Model))
 	target := strings.ToLower(strings.TrimSpace(model))

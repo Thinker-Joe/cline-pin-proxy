@@ -1,6 +1,6 @@
-// Package pin 实现 Cline Pass 的「上游钉死」注入。
+// Package pin 实现 Cline API 的上游字段注入，不限制模型 ID 的命名空间。
 //
-// Cline Pass 网关后面有两条分流管道，钉死写法完全不同，且管道归属由网关侧决定：
+// Cline 网关使用两条路由管道，各自读取不同字段，管道归属由网关决定：
 //
 //	planner（Vercel AI Gateway）：只认 providerOptions.gateway.{only,order,sort}
 //	direct （OpenRouter）        ：只认顶层 provider.{only,order,sort}

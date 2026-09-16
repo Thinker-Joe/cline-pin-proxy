@@ -1,7 +1,4 @@
-# 仓库内一律使用 LF。
-#
-# 这台开发机的 core.autocrlf=true，若不显式声明，Dockerfile 的续行、
-# shell 片段和 YAML 会以 CRLF 入库，在 Linux CI 上可能直接构建失败。
+# Keep text files on LF across Windows and Linux checkouts.
 * text=auto eol=lf
 
 *.go    text eol=lf

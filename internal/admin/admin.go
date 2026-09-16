@@ -1,10 +1,5 @@
-// Package admin 提供运行期的配置读取、规则替换与上游探测接口。
-//
-// 存在的理由：Docker 部署下改配置原本有两个硬摩擦——config.json 是挂载文件，
-// compose 察觉不到内容变化因而不会重建容器；而 distroless 镜像里没有 shell，
-// 探测上游只能靠 `docker run --rm --entrypoint ...` 绕一圈。
-//
-// 本包把这两件事都变成 HTTP 调用，可脚本化、可远程执行。
+// Package admin 提供配置读取、重载、规则替换与上游探测的 HTTP 接口。
+// 默认关闭，设置管理令牌或显式允许匿名访问后启用。
 package admin
 
 import (

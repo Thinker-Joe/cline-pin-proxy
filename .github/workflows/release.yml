@@ -15,14 +15,8 @@ env:
   GO_VERSION: '1.25'
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 发布前的验证门禁。
-  #
-  # CI 与 Release 是两个独立的 push 工作流，Release 原先没有任何测试步骤、
-  # 也不依赖 CI：main 上只要编译得过，即使单测/vet/gofmt 失败也会推 latest；
-  # 而 CI 的 push 触发器只匹配 main，tag 推送连 CI 都不会跑。
-  # 所以门禁必须建在这里，并且让 docker / binaries 都 needs 它。
-  # ---------------------------------------------------------------------------
+  # Verify the same commit before publishing, including tag and manual runs.
+  # The separate CI workflow does not establish this dependency.
   verify:
     name: Verify before publishing
     runs-on: ubuntu-latest
@@ -61,9 +55,7 @@ jobs:
             exit 1
           fi
 
-  # ---------------------------------------------------------------------------
-  # 构建多架构镜像并推送到 GHCR
-  # ---------------------------------------------------------------------------
+  # Publish multi-architecture images after verification.
   docker:
     name: Build & push image
     runs-on: ubuntu-latest
@@ -72,7 +64,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # GHCR 要求镜像名全小写，而 GitHub 用户名可能含大写。
+      # GHCR requires lowercase image names.
       - name: Compute lowercase image name
         id: image
         run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
@@ -132,9 +124,7 @@ jobs:
             echo "拉取: \`docker pull ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------------
-  # 打 tag 时额外产出裸二进制并附到 GitHub Release
-  # ---------------------------------------------------------------------------
+  # Attach binaries to GitHub Releases for version tags.
   binaries:
     name: Attach binaries to release
     if: startsWith(github.ref, 'refs/tags/v')

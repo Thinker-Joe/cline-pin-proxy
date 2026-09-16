@@ -1,12 +1,7 @@
-// Package proxy 实现带上游钉死的透传代理。
-//
-// 行为约定：
-//
-//   - 只对 POST 的 chat/completions 端点做上游注入；
-//   - 其余端点（/v1/models、/v1/responses 等）纯净透传，不替上游做决定——
-//     这很重要，因为调用方常用这些端点探测上游能力，代理不该干扰结论；
-//   - 上游状态码与响应体原样回传，调用方的故障转移逻辑才不会失灵；
-//   - 流式响应逐块 Flush，全程 O(1) 内存，不做任何 JSON 解析。
+// Package proxy 实现 Cline API 的 HTTP 转发、上游字段注入和响应格式转换。
+// 仅修改 POST chat/completions 的路由字段，其他受支持端点保留请求体。
+// 保留上游状态码，JSON 响应可按配置提取 data 中的补全。
+// SSE 使用固定大小缓冲区逐块 Flush，不解析 JSON 或等待完整响应。
 package proxy
 
 import (
@@ -213,7 +208,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, c
 
 	rule, matched := cfg.Match(model)
 	if !matched {
-		// 无规则命中时完全原样放行，由 Cline Pass 自主路由。
+		// 无规则命中时保留原始请求体，由上游网关路由。
 		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "no rule matched"))
 		return
 	}
@@ -479,7 +474,7 @@ const maxEnvelopeBytes = 8 << 20 // 8 MiB
 // 而标准 OpenAI 客户端只读顶层 choices，拿到包封会表现为"请求成功但没有内容"。
 // 这里只认这一个精确形状，其余一律原样返回：
 //
-//   - 顶层必须是无重复键的 JSON 对象；
+//   - 顶层必须是 JSON 对象；
 //   - 顶层没有 choices（有就说明已经是标准响应）；
 //   - data 是对象，且 data.choices 是非空数组。
 //
@@ -590,8 +585,7 @@ func copyResponseHeaders(dst, src http.Header) {
 
 // flushCopy 边读边写并逐块 Flush。
 //
-// 这是流式正确性的关键：任何"先读完整响应再返回"的写法都会让首字延迟退化成
-// 整段生成时间。这里全程 O(1) 内存、不做 JSON 解析、不缓冲。
+// 使用固定大小缓冲区，不解析 JSON，也不等待完整响应。
 func flushCopy(w http.ResponseWriter, src io.Reader) error {
 	rc := http.NewResponseController(w)
 	buf := make([]byte, 32<<10)

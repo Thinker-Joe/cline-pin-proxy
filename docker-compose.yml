@@ -1,43 +1,34 @@
-# cline-pin-proxy 的最小部署编排。
+# Local deployment. See README.md for client and authentication settings.
 #
-# 设计前提：代理与调用方（例如 sub2api）通常同机，因此只绑回环，
-# 不对公网暴露任何端口。
+#   mkdir -p data && cp config.example.json data/config.json
+#   docker compose up -d
 #
-# 用法（开箱即用，三步）：
-#   1) mkdir -p data && cp config.example.json data/config.json
-#   2) 编辑 data/config.json，按需加规则、设 admin_token
-#   3) CLINE_PIN_API_KEY=sk_xxx docker compose up -d
-#
-# 之后**改 data/config.json 不用重启**：进程会按 watch_seconds 轮询热重载。
-# （compose 察觉不到挂载文件的内容变化，重启容器对配置修改其实无效。）
+# Most file settings reload at watch_seconds intervals. Environment overrides
+# still take precedence; changing a container's environment requires recreation.
 
 services:
   cline-pin-proxy:
     image: ghcr.io/thinker-joe/cline-pin-proxy:latest
-    # 需要从源码构建时取消下面这行的注释（会自动覆盖上面的 image）
+    # To build locally, uncomment build and run docker compose up -d --build.
     # build: .
     container_name: cline-pin-proxy
     restart: unless-stopped
 
     ports:
-      # 只绑 127.0.0.1：仅本机进程可达，公网无法访问。
+      # Publish only on the host's loopback interface.
       - "127.0.0.1:8787:8787"
 
     environment:
-      # 刻意都用 `:-`（空默认）：compose 只要写了 `VAR: ${VAR:-默认值}`，
-      # 即使宿主没设也会往容器里注入那个默认值，而本项目是**环境变量优先于
-      # 配置文件**——那样 data/config.json 里的 upstream / forward_headers
-      # 就永远被遮蔽，热重载也救不回来。留空则退回应用内置默认值。
+      # Empty values allow the file and application defaults to take effect.
       CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-}
-      # 固定上游密钥。留空则透传调用方传来的 Authorization。
+      # A fixed upstream key replaces the client's Authorization header.
       CLINE_PIN_API_KEY: ${CLINE_PIN_API_KEY:-}
       CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-}
-      # 日志级别不是配置字段，给个默认值没有副作用。
+      # Log level has no configuration-file equivalent.
       CLINE_PIN_LOG_LEVEL: ${CLINE_PIN_LOG_LEVEL:-info}
 
-    # 配置走整个目录而不是单个文件：文件不存在时 compose 会把 bind 源建成
-    # **目录**，那是很难排查的坑；挂目录则天然安全，且 config.json 缺失时
-    # 进程会以默认值启动（随后把它创建出来即可被热重载接管）。
+    # Mount the directory to support atomic file replacement. A missing file
+    # can be created later and detected by the configuration watcher.
     volumes:
       - ./data:/etc/cline-pin-proxy
     command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
@@ -55,7 +46,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # 代理是纯转发，不需要任何特权；显式收紧。
+    # Use a read-only root filesystem; the data mount remains writable.
     security_opt:
       - no-new-privileges:true
     read_only: true

@@ -1,128 +1,89 @@
 # AGENTS.md — cline-pin-proxy
 
-本文件供 AI 代理在本仓库工作时遵循，包含通用协作原则与项目专属约定。
+本文件规定 AI 代理在本仓库中的协作方式、实现约束和验收要求。
 
----
+## 协作原则
 
-## 通用协作原则
+选择完整满足当前需求且总体复杂度最低的方案，同时考虑实现、依赖、运行、排障和维护成本。不得省略权限校验、数据一致性、故障处理或必要验证。
 
-### 总原则：KISS
+1. 修改前阅读相关代码与文档，明确目标、范围和完成标准。区分需求、设计和实现；涉及正确性、授权或难以撤销的歧义时先澄清，其余采用合理假设并说明。
+2. 每次修改保持可验证、可用，优先解决当前问题的根因，不扩大范围。
+3. 不为假想需求增加抽象、配置或扩展点。临时方案需说明风险和退出条件。
+4. 先检查已有实现和依赖，有明确收益时才自建或引入库，不无故重写通用功能。
+5. 删除已确认不再需要的实现，不擅自破坏外部接口或持久数据。
+6. 授权范围内的正常、可逆开发步骤可自主完成。销毁数据、生产变更、发布等高影响操作需事先说明并取得授权。
+7. 按风险验证，覆盖关键失败路径；修复缺陷时补充回归验证。报告实际结果，不用未经验证的判断代替测试。
+8. 如实区分事实、推断和建议。行为、接口或用法改变时同步更新文档。
 
-选择完整满足当前需求的最简单方案。衡量实现、依赖、运行、排障和维护的总体复杂度，而不只是代码行数。简单不等于省略必要的权限校验、数据一致性、故障处理或验证。
+安全、授权、数据完整性和已确认需求优先于简化实现。约束冲突时明确说明，不擅自降低要求。本文件不授予额外权限。
 
-1. **先理解，再动手。** 确认目标、范围与完成标准，按需阅读相关代码与文档。区分已确认需求、设计设想与实际实现；影响正确性、授权或难以撤销的歧义先澄清，其余采用合理假设并说明。
-2. **小步交付，保持可用。** 从能端到端验证的最小完整版本开始。修改聚焦当前任务，优先解决根因，不顺手扩大范围。
-3. **边界清晰，面向真实需要。** 不为分层而分层，不为假想需求增加抽象、配置或扩展点。临时方案须明确风险和退出条件。
-4. **先查已有，再决定自建。** 先检查现有实现与依赖，不猜测已有能力；有明确收益才引入库，不无故重写通用功能。
-5. **清理旧实现，保护契约与数据。** 不为已确认无需支持的行为保留兼容层，不擅自破坏外部接口或持久数据。
-6. **在授权范围内自主推进。** 正常、可逆的开发步骤无需逐项询问；超出授权的高影响操作（销毁数据、生产变更、发布）先说明影响并取得确认。
-7. **用证据判断完成。** 按风险选择验证，覆盖关键失败路径；修复缺陷时补上防复发验证。不以自报成功代替通过。
-8. **如实交付，维护必要文档。** 区分事实、推断和建议；行为、接口或使用方式变化时同步更新相关文档。
+## 项目概览
 
-约束（安全、授权、数据完整性、已确认需求）之内选总体复杂度最低者；约束冲突时明确指出，不擅自降低要求。本文件不授予额外权限。
+面向 Cline API 的上游路由与响应格式兼容代理。源码采用多包布局，构建为单个 Go 可执行文件；模块要求 Go 1.23，CI 和容器构建使用 Go 1.25。仅使用标准库，`go.mod` 不含第三方依赖。
 
----
+规则匹配 JSON 中的模型 ID，不限制 `cline-pass/` 前缀，也不改写模型 ID。非该前缀的 `deepseek/deepseek-v4-flash` 已有切换上游的实测记录；不能仅凭模型前缀判断是否支持上游选择。
 
-## 项目速览
+Cline 按模型选择 planner（Vercel AI Gateway）或 direct（OpenRouter）管道。默认同时写入 `providerOptions.gateway` 和顶层 `provider`。部分模型忽略过滤条件，注入成功不代表上游实际采用了指定服务商。
 
-把 Cline Pass 订阅模型背后的上游渠道钉死的轻量透传代理。
-单文件 Go 程序，**零第三方依赖**（`go.mod` 无 require），Go 1.23，约 2.1k 行源码 + 2.1k 行测试。
-
-核心机制：Cline 网关有两条互不相同的分流管道（planner → Vercel AI Gateway、
-direct → OpenRouter），钉死写法不同，本代理**两条管道都写**（`providerOptions.gateway.only`
-与顶层 `provider.only` 双写）。管道归属由 Cline 侧逐模型决定，客户端无法预知。
+英文入口为 [README.md](README.md)，中文入口为 [README.zh-CN.md](README.zh-CN.md)。修改用户可见行为时同步更新两版。
 
 ## 常用命令
 
 ```bash
-go build -o cline-pin-proxy ./cmd/cline-pin-proxy   # 构建
-go test ./...                                        # 全部单测（每次改动后必跑）
-go test -race ./...                                  # 竞态检测（需 cgo；CI 上跑）
-go vet ./...                                         # CI 必查
-gofmt -l .                                           # 必须输出为空
-go test -cover ./...                                 # 覆盖率
-bash scripts/linux-check.sh                           # 在 Linux 容器里跑一遍（见下）
+go build -o cline-pin-proxy ./cmd/cline-pin-proxy
+go test ./...
+go test -race ./...
+go vet ./...
+gofmt -l .
+go test -cover ./...
+bash scripts/linux-check.sh
 ```
 
-**本项目在 Windows 上开发、在 Linux 上发布**，两者的差异会直接导致编译失败，
-而 Windows 上的 `gofmt` / `go vet` 发现不了。真实踩过的例子：Linux 上
-`syscall.ENOTSUP` 与 `syscall.EOPNOTSUPP` 是同一个常量，`switch` 里同时列出
-就是重复 case，直接编译失败；Windows 上两者却是不同的值，本地一路绿灯。
+每次改动后运行 `go test ./...`；`gofmt -l .` 必须无输出，`go vet` 必须通过。涉及并发路径时运行 race 检测，需要 cgo 和 C 编译器。
 
-因此**凡改动涉及 errno 常量、文件权限语义、路径分隔符**，推之前必须跑一次：
+开发涉及 Windows，发布目标包含 Linux。修改 errno、文件权限或路径处理时，推送前必须运行 `bash scripts/linux-check.sh`，需要 Docker。Linux 上 `ENOTSUP` 与 `EOPNOTSUPP` 值相同，不能同时作为 switch case；Windows 检查无法发现此类跨平台编译问题。
 
-```bash
-bash scripts/linux-check.sh     # 需要 Docker，任何平台都能跑
-```
+子命令为 `serve`（默认）、`probe`、`check`、`healthcheck`、`version`。`probe` 通过路由错误解析候选，忽略过滤条件的模型可能产生推理费用。二进制需用 `-config` 显式指定文件；Compose 已指定挂载的 `data/config.json`，默认启用热重载。
 
-子命令：`serve`（默认）、`probe`（探测模型可用上游，不消耗 token）、
-`check`（校验配置）、`healthcheck`、`version`。
-
-Docker：`docker compose up -d`，配置挂载在 `./data/config.json`，改它**不用重启**（热重载）。
-
-## 代码结构
+## 文件职责
 
 | 路径 | 职责 |
 |---|---|
-| `cmd/cline-pin-proxy/main.go` | 入口、子命令分发、日志初始化 |
-| `internal/proxy/` | 透传代理 Server：路由、流式逐块 Flush、响应头决策 |
-| `internal/pin/` | 注入核心：解析请求体 → 深度合并 → 重新编码 |
-| `internal/config/` | 配置解析与默认规则；`Store` 提供热重载（mtime 轮询 + 原子替换）与规则落盘 |
-| `internal/admin/` | 管理 API（默认整体 404 关闭） |
-| `internal/probe/` | 用 `__probe__` 假上游名从网关错误信息反解可用渠道清单 |
-| `docs/VERIFICATION.md` | 真实网关实测记录，slug 与管道结论的唯一权威来源 |
-| `docs/CODE_REVIEW.md` | 外部审查报告 + 逐项处置结果；`*_test.go` 里的 `boundary_*.go` 是它留下的回归 |
+| `cmd/cline-pin-proxy/` | CLI、日志、启动和退出 |
+| `internal/proxy/` | HTTP 路由、转发、逐块 Flush、响应格式转换 |
+| `internal/pin/` | 解析请求并注入上游字段 |
+| `internal/config/` | 默认值、校验、mtime 轮询、配置快照和规则持久化 |
+| `internal/admin/` | 管理 API 与认证 |
+| `internal/probe/` | 注入 `__probe__` 并解析网关错误中的候选列表 |
+| `CONTRIBUTING.md` | 开发检查与发布流程 |
+| `docs/VERIFICATION.md` | 上游标识、管道与延迟的实测依据 |
+| `docs/CODE_REVIEW.md` | 历史审查、修复和当前实现限制 |
 
-## 行为不变量（改动前必读）
+各包的 `boundary_test.go` 保留代码审查回归；响应转换测试位于 `internal/proxy/envelope_test.go`。
 
-这些是刻意设计的，**改动任何一条必须先向用户说明影响并更新 README「行为约定」**：
+## 行为约束
 
-- 只注入 `POST /v1/chat/completions`；**其余端点纯净透传**，调用方靠它们探测上游能力。
-- 未命中规则时完全原样转发；注入失败时降级为未钉死透传并在 `X-Cline-Pin-Note` 注明。
-- 上游状态码与响应体**原样回传**，调用方的故障转移逻辑依赖这一点。
-  由此推出两条硬约束：**不跟随重定向**（`CheckRedirect` 返回 `ErrUseLastResponse`，
-  30x 连同 `Location` 原样回传）；**上游中途断开时主动断连**
-  （`panic(http.ErrAbortHandler)`），否则下游会把残缺内容当成正常结束。
-- **唯一的响应体改写**是把 Cline 的非标准包封还原成标准 OpenAI 形状
-  （`unwrap_data_envelope`，默认开启）。Cline 会把补全包成
-  `{"data":{...},"success":true}`，而客户端只读顶层 `choices`。
-  改这段时必须守住三条：**只认精确形状**（顶层无 choices + data 是对象 +
-  data.choices 非空数组）、**SSE 一个字节都不缓冲**（`isJSONContentType` 排除
-  `text/event-stream`）、**超上限不静默跳过**（打 `X-Cline-Pin-Unwrapped`）。
-  这三条都有测试锁定，改坏了会直接让首字延迟退化或让下游静默截断。
-- **路径必须先过 `safeRoutePath`**：拒绝一切百分号转义与点段。
-  Go 1.22+ 的 ServeMux 用 `EscapedPath()` 做 cleanPath 匹配，`%2e%2e` 不会被规范化，
-  而处理器读到的 `URL.Path` 已解码——直接用它会拼出能跳出 `/v1/` 前缀的上游地址。
-- **一次请求只用一份配置快照**（`handle` 里取一次 `cfg` 往后传），
-  否则热重载插在中间会让请求发往旧上游却带新密钥。
-- 流式响应逐块 Flush、全程 O(1) 内存、不解析响应体；**不设 `http.Client.Timeout`**，
-  超时由 dial / TLS / 响应头三段分别控制（整体超时会砍断长流式回答）。
-- 注入用 `json.Number` 承载数字、关闭 HTML 转义，保证除注入字段外请求体语义不变
-  （大整数精度、`< > &` 原样保留）——改注入逻辑必须保留这两点并跑 `pin` 包测试。
-- 注入时**代理是路由字段的唯一决定者**：在它写入的那条管道上，`preferred` 会清掉
-  调用方的 `only` 与 `allow_fallbacks=false`（否则回退顺序静默失效），`strict` 清掉
-  `order`。其它字段一律不动。
-- 内置 GLM 两条规则的顺序与 slug 有实测依据（`glm-5.3`→friendli、`glm-5.3-flash`→relace，
-  两条管道渠道池不通用），**不要合并成泛化的 `glm`，不要调整顺序**；
-  换 slug 前先 `probe` 并在对应模型上实测，结论写进 `docs/VERIFICATION.md`。
-- 配置解析失败或文件被删除时**保持上一份好配置继续生效**，不中断服务。
-  但**启动时文件非法会直接失败**（只有「文件不存在」才降级为默认值）——这是有意的
-  不对称：缺失是「还没配」，非法是「配错了」，静默降级会让人以为规则生效了。
-- 配置文件里**一旦出现 `rules` 就是整体替换**，不与内置默认表合并；
-  同理，**显式给出但非法的环境变量一律让加载失败**，不静默回退。
-- 写回配置只替换 `rules` 键（用 `map[string]json.RawMessage` 保数字精度），
-  且**只在确认"原子替换做不到"**时才退化为原地覆盖；`ENOSPC`/`EIO` 直接报错，
-  绝不截断唯一的配置文件。
-- 管理 API 未配置 `admin_token` 时**整组返回 404**（不是 403），且 `GET /admin/config`
-  必须隐去 `api_key` 与 `admin_token`。`PUT /admin/rules` 拒绝 `null`
-  （清空只能显式写 `[]`），裸数组与 `{"rules":[...]}` 两种写法都接受。
+改变以下约定前，应向用户说明影响，并更新英文 README 的“Behavior and security”及中文 README 的“行为约定与安全”。文档记录的实现例外不能当作预期行为；修复时补充失败路径验证。
 
-## 约定与验收
+- 只对 `POST /v1/chat/completions` 及 `/chat/completions`、`/api/v1/chat/completions` 别名注入上游字段。其他受支持端点不改写请求体，保留调用方探测上游能力的结果。
+- 未命中规则时保留原始请求体。注入失败时同样原样转发，并设置 `X-Cline-Pin-Note`。
+- 保留上游状态码，不跟随重定向，30x 与 `Location` 返回调用方。上游读取异常时应中止下游响应，不能把残缺正文当作正常结束；使用 `http.ErrAbortHandler`，不要在已开始的正文后附加错误 JSON。
+- 响应体唯一允许的内容转换是 `unwrap_data_envelope`，默认开启。仅转换 JSON Content-Type、顶层无 `choices`、`data` 为对象且 `data.choices` 为非空数组的响应。SSE 不进入整包缓冲。JSON 超过 8 MiB 后原样转发，并设置 `X-Cline-Pin-Unwrapped: skipped-too-large`。
+- 转发路径必须先经过 `safeRoutePath`。拒绝编码路径与点段，避免把 ServeMux 匹配的转义路径解码后拼成越过 API 前缀的上游地址。
+- 每个转发请求只读取一份配置快照，并传给后续步骤，防止热重载导致上游地址和密钥来自不同配置。
+- 流式响应使用固定大小缓冲区，逐块 Flush，不解析 JSON，不等待完整响应。不设置 `http.Client.Timeout`；分别控制连接、TLS 和响应头超时。
+- 请求注入用 `json.Number` 保留数字精度，关闭 HTML 转义，保持其他字段的 JSON 语义及 `< > &`。修改注入逻辑时运行 pin 包测试。
+- 在指定管道中，preferred 删除调用方的 `only` 与 `allow_fallbacks`，strict 删除 `order`。配置了 `sort` 才覆盖原排序值，不修改无关选项。`sort` 不会取消 strict 的 `only`。
+- 默认 GLM 规则保留 `glm-5.3-flash → relace` 在前、`glm-5.3 → friendli` 在后。不得合并为宽泛的 `glm`。修改标识前，必须对对应模型 probe 并发送真实请求确认路由，记录到 `docs/VERIFICATION.md`。
+- 运行期配置非法或文件删除时保留上一份有效配置。启动时已有非法文件应失败；仅文件不存在时可使用默认值和环境设置启动。
+- 文件一旦包含 `rules` 就整体替换默认表。显式非法环境值应导致加载失败；文件缺失启动分支的现有例外见代码审查文末。
+- 持久化只替换 `rules`，使用 `map[string]json.RawMessage` 保留其他值和数字精度，不把环境密钥写入文件。只有确认无法原子替换时才考虑原地写入；`ENOSPC`、`EIO` 直接报错，不能为重试截断原文件。
+- 未配置 `admin_token` 且未显式允许匿名时，管理 API 返回 404。配置令牌后必须验证凭据。`GET /admin/config` 不返回 `api_key` 和 `admin_token`。`PUT /admin/rules` 接受数组或 `{"rules":[...]}`，拒绝 `null`，清空需显式 `[]`。
 
-- **零第三方依赖是硬约束**。引入任何依赖前先说明理由并取得确认；标准库能做的用标准库。
-- 验收标准：`gofmt -l .` 为空、`go vet` 无告警、`go test ./...` 全绿；
-  涉及并发路径的改动跑 `go test -race`。改动行为时同步更新 README 相关段落。
-- 新增 slug / 管道结论只认 `docs/VERIFICATION.md` 里的实测数据，不凭网关文档或推测。
-- 敏感信息（`api_key`、`admin_token`、真实 Cline Pass key）**绝不提交**；
-  `config.json`、`data/` 已被 `.gitignore` 排除，保持排除。
-- 不主动 commit / push / 打 tag，除非用户明确要求。
+## 验收与提交
+
+- 零第三方依赖是硬约束。新增依赖前说明理由并取得确认。
+- 验收要求：`go test ./...`、`go vet ./...` 通过，`gofmt -l .` 无输出；并发与跨平台改动按上文补充验证。
+- 新增上游标识和管道结论必须有 `docs/VERIFICATION.md` 中的实测依据，不使用网关文档或推测替代。历史数据应保留日期与适用范围。
+- 不提交密钥，保留 `config.json`、`data/` 的 git 忽略规则。
+- 未经用户明确要求，不执行 commit、push 或创建 tag。

@@ -1,8 +1,7 @@
-// Package probe 用「假上游」技巧枚举某个模型背后真实可用的上游渠道。
+// Package probe 从网关路由错误中解析模型的上游候选。
 //
-// 原理：给请求注入一个不存在的上游名（__probe__），网关会在路由层直接失败。
-// 因为不存在任何可用候选，这次请求不会走到推理后端，所以基本不消耗 token，
-// 而错误信息里会带上它当前可用的完整渠道清单。
+// 探测注入不存在的上游名 __probe__。支持过滤的模型在路由层拒绝请求，
+// 错误响应可能包含候选列表。列表不保证完整；忽略过滤的模型可能执行推理并计费。
 //
 // 真实响应结构（2026-09 实测，api.cline.bot）：
 //
@@ -166,7 +165,7 @@ func detectPipeline(text string) string {
 	return ""
 }
 
-// extractAvailableProvidersArray 抠出 available_providers 的 JSON 数组。
+// extractAvailableProvidersArray 提取 available_providers 的 JSON 数组。
 //
 // 刻意不用正则：真实响应里这个字段被包在「JSON 字符串套 JSON」的双层转义中，
 // 引号前带反斜杠（形如 \"available_providers\"），引号敏感的正则很容易漏掉。
