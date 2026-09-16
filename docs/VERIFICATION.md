@@ -600,3 +600,132 @@ GET /api/v1/models → 200
 恰恰证明代理的规则匹配与注入都正常，只是上游拒绝了那个凭据。
 真实补全改用 sub2api 的账号测试接口，它从账号配置里取真实 key。
 
+---
+
+## 十三、Cline 的 `{data:{...}}` 包封与非流式补全（2026-09-16）
+
+**起因**：有报告称客户端 `vision_analyze` 读图报错，现象是"走网关时返回
+`{data:{choices}}` 包封，适配器只读顶层 `choices`"，并怀疑与把 Cline 账号的
+`base_url` 改成代理地址有关。
+
+### 1. 「sub2api 对 Cline 的 URL 有特殊处理」这个假设不成立
+
+对 `sub2api` 全仓检索：
+
+```
+$ rg -ni 'cline\.bot' .          # 零命中
+$ rg -ni 'cline' -g '!node_modules' .
+backend/internal/service/openai_gateway_response_handling.go:1330:  // 部分 OpenAI 兼容上游（例如 Cline API）…
+backend/internal/service/openai_gateway_service_test.go:526:        func TestExtractOpenAIUsage_ReadsClineDataEnvelope
+```
+
+**没有任何基于 URL / 主机名的 Cline 识别**。把 `base_url` 换成代理地址，
+不可能"让 sub2api 认不出来"而关掉某段兼容逻辑——那段逻辑根本不存在。
+
+### 2. 真实机制
+
+sub2api 自己的注释就是最权威的说明：
+
+> 部分 OpenAI 兼容上游（例如 Cline API）会将标准响应包在 data 字段中：
+> `{"data":{"choices": [...], "usage": {...}}, "success":true}`。
+> 按优先级先保留原有路径，再尝试兼容层 data 包装，
+> **避免同步请求能正常返回但用量被静默记录为 0**。
+
+也就是说：sub2api **知道**这个包封，但只为**用量统计**加了 `data.usage` 兼容，
+**正文仍然原样透传给客户端**（注释里的"同步请求能正常返回"正是此意）。
+所以只要模型被路由到 Cline 账号、且客户端用非流式，就会踩到。
+
+真实包封（本次抓取，已截去 `provider_metadata` 细节）：
+
+```json
+{"data":{"choices":[{"finish_reason":"stop","index":0,"logprobs":null,
+  "message":{"content":"ok","role":"assistant"}}],
+  "created":1789540261,"generationId":"gen_01M2…","id":"gen_01M2…",
+  "model":"vmc/k3-contributor-fallbacks","object":"chat.completion",
+  "system_fingerprint":"fp_9q1cawe42q",
+  "usage":{"completion_tokens":16,"prompt_tokens":103,"total_tokens":119}},
+ "success":true}
+```
+
+### 3. 关键约束：**只有非流式会这样**
+
+矩阵探测（模型 × 是否带图 × 是否流式，2026-09-16）：
+
+| 模型 | 图 | 流式 | 形状 |
+|---|---|---|---|
+| `kimi-k3` | 无 | **否** | **`data` 包封** |
+| `kimi-k3` | 有 | **否** | **`data` 包封** |
+| `kimi-k3` | 无 / 有 | 是 | 标准 SSE |
+| `deepseek-flash` | 无 / 有 | 否 / 是 | 标准 |
+| `deepseek-v4.1-flash` | 无 / 有 | 否 / 是 | 标准 |
+| `glm-5.3-flash` | 无 / 有 | 否 / 是 | 标准 |
+
+流式之所以正常，是因为 sub2api 必须解析 SSE 才能计费，重发时就已是标准事件；
+非流式则是原样转发，包封原封不动地漏给客户端。
+
+`kimi-k3` 在账号 268（Cline Pass）映射为 `cline-pass/kimi-k3`——确认走 Cline。
+
+### 4. 修复与 A/B 对照（决定性证据）
+
+在代理侧还原包封（`unwrap_data_envelope`，默认开启）。用**同一台生产环境**
+做开关对照，探测 `kimi-k3` 非流式：
+
+| `unwrap_data_envelope` | 顶层 `choices` | `data` 包封 | 客户端结果 |
+|---|---|---|---|
+| **开启**（默认） | ✅ True | False | 正常 |
+| **关闭** | False | ✅ True | **失败（复现原始症状）** |
+| 恢复开启 | ✅ True | False | 正常 |
+
+这一对照同时证明了三件事：该请求**确实经过本代理**、包封**来自 Cline**、
+以及形状变化**确实是代理造成的**（而不是路由漂移）。
+
+### 5. 实现取舍
+
+- **只认精确形状**：顶层无 `choices`、`data` 是对象、`data.choices` 是非空数组。
+  其余（标准响应、`/v1/models` 的 `data` 数组、错误体、纯数组）一律原样转发，
+  已有 10 组反例测试锁定。
+- **流式一个字节都不缓冲**：`isJSONContentType` 把 `text/event-stream` 排除在外；
+  测试断言"上游仍挂起时下游必须已收到首字节"，防止有人日后为了省事把 SSE 也缓冲了。
+- **缓冲上限 8 MiB**：超过则原样流式转发，并打
+  `X-Cline-Pin-Unwrapped: skipped-too-large`。宁可还原不了也不 OOM，
+  且**不静默跳过**——静默会让人以为代理坏了。
+- **读到一半断开**时按既有约定主动断连，不把半截 JSON 当完整响应返回。
+- 还原后补 `Content-Length`，避免下游按错误长度截断或挂起。
+- 可用 `unwrap_data_envelope: false` 完全关闭，给需要严格原样透传的部署留出口。
+
+### 6. 顺带发现的两处配置漂移（未擅自改动，供决策）
+
+对照 2026-09-16 04:03 的账号备份 `cline_pass_accounts_backup_20260916040328.json`：
+
+**① 账号 268 的 `model_mapping` 变了**（8 项 → 7 项）：
+
+| 备份（04:03） | 现在 |
+|---|---|
+| `deepseek-flash-LJ` → `cline-pass/deepseek-v4.1-flash` | `deepseek-flash` → 同 |
+| `deepseek-v4-flash-pass` → `cline-pass/deepseek-v4-flash` | **已删除** |
+| `deepseek-v4-flash-vision-exp-pass` → `cline-pass/deepseek-v4-flash-vision-exp` | **已删除** |
+| `glm-5.3-flash-solw` → `cline-pass/glm-5.3-flash` | `glm-5.3-flash` → 同 |
+| — | `deepseek-v4.1-flash`（新增） |
+
+如果还有客户端在用 `deepseek-v4-flash-vision-exp-pass` 这类名字，现在会拿不到模型。
+**注意**：`base_url` 的改动不会影响 `model_mapping`，两者是独立的字段。
+
+**② 账号 248 `OpenCode GO - joecoffee` 当前 `schedulable=false`**
+（`base_url` = `https://opencode.ai/zen/go`，映射 `kimi-k3 → kimi-k3`）。
+`last_used_at` 11:09:38、`updated_at` 11:09:48。该账号停用后，`kimi-k3`
+等模型会回退到 Cline 账号——也就是更容易暴露上面的包封问题。
+`schedulable` 是管理 API 可写的字段（`admin_account.go` 的
+`repoUpdates.Schedulable = input.Schedulable`），本次排查中**只对该账号发过 GET**。
+
+**结论**：包封问题**不是** `base_url` 改动引入的，它一直存在；
+但上面两处漂移会改变"哪些请求会走到 Cline"，从而改变这个问题的**暴露频率**。
+建议先把 248 恢复调度（若其凭据仍有效），再决定 268 的映射是否要补回。
+
+### 7. 仍未验证
+
+- 未在客户端侧（`vision_analyze` 所在的 agent）确认其使用的具体模型名，
+  因此"它是否经由 Cline"是**推断**而非直证；直证的是
+  "`kimi-k3` 非流式经本代理会得到包封，开启还原后得到标准形状"。
+- 未验证 `unwrap_data_envelope` 在超过 8 MiB 的大响应上的线上表现
+  （单测覆盖了逐字节完整性，但没有真实的大响应流量）。
+

@@ -192,6 +192,11 @@ func TestConfigEndpointDoesNotLeakSecrets(t *testing.T) {
 	if out["upstream"] != "https://api.cline.bot/api/v1" {
 		t.Errorf("upstream = %v", out["upstream"])
 	}
+	// 每个配置字段都应该能在这里看到，否则排查"为什么配置没生效"时
+	// 就得去翻容器里的文件。真实踩过：这个字段落后于 Config 结构体。
+	if _, ok := out["unwrap_data_envelope"]; !ok {
+		t.Error("/admin/config 必须暴露 unwrap_data_envelope（否则无法确认它是否生效）")
+	}
 }
 
 func TestGetRules(t *testing.T) {

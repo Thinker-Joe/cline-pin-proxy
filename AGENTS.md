@@ -83,6 +83,13 @@ Docker：`docker compose up -d`，配置挂载在 `./data/config.json`，改它*
   由此推出两条硬约束：**不跟随重定向**（`CheckRedirect` 返回 `ErrUseLastResponse`，
   30x 连同 `Location` 原样回传）；**上游中途断开时主动断连**
   （`panic(http.ErrAbortHandler)`），否则下游会把残缺内容当成正常结束。
+- **唯一的响应体改写**是把 Cline 的非标准包封还原成标准 OpenAI 形状
+  （`unwrap_data_envelope`，默认开启）。Cline 会把补全包成
+  `{"data":{...},"success":true}`，而客户端只读顶层 `choices`。
+  改这段时必须守住三条：**只认精确形状**（顶层无 choices + data 是对象 +
+  data.choices 非空数组）、**SSE 一个字节都不缓冲**（`isJSONContentType` 排除
+  `text/event-stream`）、**超上限不静默跳过**（打 `X-Cline-Pin-Unwrapped`）。
+  这三条都有测试锁定，改坏了会直接让首字延迟退化或让下游静默截断。
 - **路径必须先过 `safeRoutePath`**：拒绝一切百分号转义与点段。
   Go 1.22+ 的 ServeMux 用 `EscapedPath()` 做 cleanPath 匹配，`%2e%2e` 不会被规范化，
   而处理器读到的 `URL.Path` 已解码——直接用它会拼出能跳出 `/v1/` 前缀的上游地址。

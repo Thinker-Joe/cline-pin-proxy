@@ -112,14 +112,15 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := h.store.Current()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"listen":              cfg.Listen,
-		"upstream":            cfg.Upstream,
-		"forward_headers":     cfg.ForwardHeaders,
-		"probe_headers":       cfg.ProbeHeaders,
-		"max_body_bytes":      cfg.MaxBodyBytes,
-		"watch_seconds":       cfg.WatchSeconds,
-		"admin_auth_required": strings.TrimSpace(cfg.AdminToken) != "",
-		"rules":               cfg.Rules,
+		"listen":               cfg.Listen,
+		"upstream":             cfg.Upstream,
+		"forward_headers":      cfg.ForwardHeaders,
+		"probe_headers":        cfg.ProbeHeaders,
+		"max_body_bytes":       cfg.MaxBodyBytes,
+		"watch_seconds":        cfg.WatchSeconds,
+		"unwrap_data_envelope": cfg.UnwrapDataEnvelope,
+		"admin_auth_required":  strings.TrimSpace(cfg.AdminToken) != "",
+		"rules":                cfg.Rules,
 	})
 }
 
