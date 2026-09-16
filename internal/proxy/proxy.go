@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -383,22 +384,147 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, cfg *config.Con
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
 
-	if err := flushCopy(w, resp.Body); err != nil {
-		if r.Context().Err() != nil {
-			return // 客户端主动断开，正常收场
+	// 非流式 JSON 响应里若出现 Cline 的 data 包封，先还原成标准形状再回传。
+	//
+	// 判断必须放在写响应头之前：还原会改变正文长度，而 Content-Length 本来
+	// 就不透传（交给 Go 自己算），所以顺序上只要在第一次 Write 之前决定即可。
+	// 流式响应一个字都不能缓冲，isJSONContentType 会把 SSE 排除在外。
+	if cfg.UnwrapDataEnvelope && isJSONContentType(resp.Header.Get("Content-Type")) {
+		if body, ok := s.bufferForUnwrap(w, resp, target); ok {
+			original := len(body)
+			if unwrapped, changed := UnwrapDataEnvelope(body); changed {
+				body = unwrapped
+				w.Header().Set("X-Cline-Pin-Unwrapped", "data-envelope")
+				s.log.Debug("unwrapped cline data envelope",
+					"target", target, "in", original, "out", len(body))
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(resp.StatusCode)
+			if _, err := w.Write(body); err != nil {
+				s.log.Debug("writing response body failed", "error", err)
+			}
+			return
 		}
-		// 响应头已经写出去了，没法再改成 5xx。但如果就这么返回，下游会把
-		// 被截断的内容当成"正常结束"——因为 Content-Length 不透传，HTTP 层
-		// 没有任何失败信号，SSE 客户端可能一直等下去或把半句话当完整回答。
-		//
-		// http.ErrAbortHandler 会让 net/http 直接断开连接（并抑制堆栈噪音），
-		// 客户端因此拿到 unexpected EOF，而不是一份"成功"的残缺响应。
-		s.log.Warn("upstream response ended prematurely, aborting downstream connection",
-			"target", target, "error", err)
+		// bufferForUnwrap 已经写好响应头并把正文转发出去（或已判定无法缓冲）。
+		return
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if err := flushCopy(w, resp.Body); err != nil {
+		s.abortOnBrokenStream(w, r, target, err)
+	}
+}
+
+// bufferForUnwrap 尝试把整个响应体读进内存以便还原包封。
+//
+// 返回 (body, true) 表示已完整缓冲，调用方可以改写后自行写出；
+// 返回 (_, false) 表示这条响应不适合缓冲，正文已经交给流式路径转发完毕。
+//
+// 内存约束：上限 maxEnvelopeBytes。超过上限时**不能丢弃已读走的数据**，
+// 所以把前缀写出去、再流式转发剩余部分。
+func (s *Server) bufferForUnwrap(w http.ResponseWriter, resp *http.Response, target string) ([]byte, bool) {
+	buf, err := io.ReadAll(io.LimitReader(resp.Body, maxEnvelopeBytes+1))
+	if err != nil {
+		// 读到一半断了。绝不能把半截 JSON 当完整响应返回——下游看到的是
+		// 一个"成功"的响应，却少了后半段内容，且没有任何失败信号。
+		// 与流式路径保持同一约定：把已有的写出去，然后主动断连。
+		s.log.Warn("non-streaming response ended prematurely, aborting downstream connection",
+			"target", target, "error", err, "bytes_read", len(buf))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(buf)
 		panic(http.ErrAbortHandler)
 	}
+
+	if int64(len(buf)) > maxEnvelopeBytes {
+		// 太大：不解析，前缀 + 剩余一起流式转发，行为与不开启还原时一致。
+		s.log.Warn("response too large to unwrap, relaying verbatim",
+			"target", target, "limit_bytes", maxEnvelopeBytes)
+		w.Header().Set("X-Cline-Pin-Unwrapped", "skipped-too-large")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(buf)
+		_ = flushCopy(w, resp.Body)
+		return nil, false
+	}
+
+	return buf, true
+}
+
+// isJSONContentType 判断响应是否为可整体解析的 JSON。
+//
+// SSE 是 text/event-stream，必须走流式路径：它一个字都不能缓冲，否则首字延迟
+// 会退化成整段生成时间——这正是本项目存在的意义之一。
+func isJSONContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	return ct == "application/json" || strings.HasSuffix(ct, "+json")
+}
+
+// maxEnvelopeBytes 是包封还原允许缓冲的响应体上限。
+//
+// 非流式补全本身就是要整体返回的，客户端也在等完整 JSON，所以缓冲它不改变
+// 语义；但必须有上限，否则并发几个大响应就能把代理内存吃满。超过上限的响应
+// 原样流式转发（并在响应头里注明），宁可还原不了也不能 OOM。
+const maxEnvelopeBytes = 8 << 20 // 8 MiB
+
+// UnwrapDataEnvelope 把 Cline API 的非标准包封还原成标准 OpenAI 响应。
+//
+// Cline 的原始形状：
+//
+//	{"data": {"id":"gen_...","object":"chat.completion","choices":[...],"usage":{...}},
+//	 "success": true}
+//
+// 而标准 OpenAI 客户端只读顶层 choices，拿到包封会表现为"请求成功但没有内容"。
+// 这里只认这一个精确形状，其余一律原样返回：
+//
+//   - 顶层必须是无重复键的 JSON 对象；
+//   - 顶层没有 choices（有就说明已经是标准响应）；
+//   - data 是对象，且 data.choices 是非空数组。
+//
+// 返回还原后的 body 与是否发生还原。
+func UnwrapDataEnvelope(body []byte) ([]byte, bool) {
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, false
+	}
+	if _, standard := fields["choices"]; standard {
+		return nil, false
+	}
+	inner, ok := fields["data"]
+	if !ok {
+		return nil, false
+	}
+	var innerFields map[string]json.RawMessage
+	if err := json.Unmarshal(inner, &innerFields); err != nil {
+		return nil, false
+	}
+	choices, ok := innerFields["choices"]
+	if !ok {
+		return nil, false
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal(choices, &list); err != nil || len(list) == 0 {
+		return nil, false
+	}
+	return inner, true
+}
+
+// abortOnBrokenStream 处理上游响应中途断开。
+func (s *Server) abortOnBrokenStream(w http.ResponseWriter, r *http.Request, target string, err error) {
+	if r.Context().Err() != nil {
+		return // 客户端主动断开，正常收场
+	}
+	// 响应头已经写出去了，没法再改成 5xx。但如果就这么返回，下游会把
+	// 被截断的内容当成"正常结束"——因为 Content-Length 不透传，HTTP 层
+	// 没有任何失败信号，SSE 客户端可能一直等下去或把半句话当完整回答。
+	//
+	// http.ErrAbortHandler 会让 net/http 直接断开连接（并抑制堆栈噪音），
+	// 客户端因此拿到 unexpected EOF，而不是一份"成功"的残缺响应。
+	s.log.Warn("upstream response ended prematurely, aborting downstream connection",
+		"target", target, "error", err)
+	panic(http.ErrAbortHandler)
 }
 
 // copyRequestHeaders 只透传白名单内的请求头。

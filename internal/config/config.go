@@ -101,6 +101,16 @@ type Config struct {
 	// AdminAllowUnauthenticated 在未设置 token 时也启用管理 API。
 	// 仅在只绑回环、且确定没有其它本机进程会访问时开启。
 	AdminAllowUnauthenticated bool `json:"admin_allow_unauthenticated"`
+	// UnwrapDataEnvelope 把 Cline API 的非标准响应包封还原成标准 OpenAI 形状。
+	//
+	// Cline 会把整个补全包在 data 里：{"data":{...标准补全...},"success":true}。
+	// 而绝大多数 OpenAI 客户端（含 sub2api 之后的各类适配器）只读顶层 choices，
+	// 于是拿到一个"成功但没有 choices"的响应。实测只有**非流式**响应会这样，
+	// 流式 SSE 的事件是标准的。
+	//
+	// 代理已经在这条链路上，把这一步做掉可以让任何客户端都拿到正常响应，
+	// 而不必指望每个下游都自己兼容 Cline 的怪癖。
+	UnwrapDataEnvelope bool `json:"unwrap_data_envelope"`
 	// Rules 是钉死规则表。
 	Rules []Rule `json:"rules"`
 }
@@ -142,6 +152,9 @@ func Default() *Config {
 		Upstream:     DefaultUpstream,
 		MaxBodyBytes: DefaultMaxBodyBytes,
 		WatchSeconds: DefaultWatchSeconds,
+		// Cline 的非标准包封默认还原：客户端只读顶层 choices，不还原就等于
+		// 给下游塞一个"成功但没内容"的响应。要原样透传可显式关掉。
+		UnwrapDataEnvelope: true,
 		// Cline 网关会用这个头区分调用方，上游侧常见配置依赖它，因此默认透传。
 		ForwardHeaders: []string{"x-client-type"},
 		// 探测时也要带上同一个头，否则部分模型（如 deepseek/... 规范名）
@@ -229,6 +242,7 @@ func applyFile(cfg *Config, raw []byte) error {
 		{"api_key", &cfg.APIKey},
 		{"admin_token", &cfg.AdminToken},
 		{"admin_allow_unauthenticated", &cfg.AdminAllowUnauthenticated},
+		{"unwrap_data_envelope", &cfg.UnwrapDataEnvelope},
 		{"max_body_bytes", &cfg.MaxBodyBytes},
 		{"watch_seconds", &cfg.WatchSeconds},
 	}
@@ -306,6 +320,13 @@ func applyEnv(cfg *Config) error {
 			return fmt.Errorf("CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED must be a boolean, got %q", v)
 		}
 		cfg.AdminAllowUnauthenticated = b
+	}
+	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_UNWRAP_DATA_ENVELOPE")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("CLINE_PIN_UNWRAP_DATA_ENVELOPE must be a boolean, got %q", v)
+		}
+		cfg.UnwrapDataEnvelope = b
 	}
 	if v := strings.TrimSpace(os.Getenv("CLINE_PIN_FORWARD_HEADERS")); v != "" {
 		cfg.ForwardHeaders = splitList(v)

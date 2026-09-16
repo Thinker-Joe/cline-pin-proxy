@@ -12,6 +12,8 @@
   "admin_token": "",
   "admin_allow_unauthenticated": false,
 
+  "unwrap_data_envelope": true,
+
   "rules": [
     {
       "name": "deepseek",

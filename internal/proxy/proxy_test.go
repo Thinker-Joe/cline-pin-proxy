@@ -45,7 +45,10 @@ func newServer(t *testing.T, upstream string, rules ...config.Rule) *Server {
 	cfg := &config.Config{
 		Upstream:     upstream,
 		MaxBodyBytes: 1 << 20,
-		Rules:        rules,
+		// 与 config.Default() 保持一致：测试要跑的是真实默认行为，
+		// 不能因为手搓结构体漏了字段而测出一个生产环境不会出现的组合。
+		UnwrapDataEnvelope: true,
+		Rules:              rules,
 	}
 	if err := cfg.Normalize(); err != nil {
 		t.Fatalf("normalize config: %v", err)

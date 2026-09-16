@@ -236,6 +236,7 @@ cp config.example.json config.json      # Docker 部署则是 data/config.json
 | `watch_seconds` | `5` | 配置热重载轮询间隔；`0` 关闭热重载。**启动时读取一次** |
 | `admin_token` | 空 | 管理 API 令牌；留空且未开 `admin_allow_unauthenticated` 时管理 API 整体不可见 |
 | `admin_allow_unauthenticated` | `false` | 显式允许无令牌访问管理 API（仅限完全可信的本机环境） |
+| `unwrap_data_envelope` | `true` | 把非流式 JSON 响应里的 Cline `{data:{...}}` 包封还原成标准 OpenAI 形状 |
 
 `listen` 与 `watch_seconds` **只在启动时读取一次**（前者无法在不中断连接的前提下重新绑定，
 后者要改的是轮询循环本身）；**其余字段全部参与热重载**，包括 `admin_token` ——
@@ -330,6 +331,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
 | `CLINE_PIN_WATCH_SECONDS` | 热重载轮询间隔秒数；`0` 关闭 |
 | `CLINE_PIN_ADMIN_TOKEN` | 管理 API 令牌 |
 | `CLINE_PIN_ADMIN_ALLOW_UNAUTHENTICATED` | `true` 时允许无令牌访问管理 API |
+| `CLINE_PIN_UNWRAP_DATA_ENVELOPE` | `false` 时关闭 Cline `data` 包封还原 |
 | `CLINE_PIN_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 
 > 配置里的 `api_key`、`admin_token` 属敏感字段，**环境变量的值不会被写回配置文件** ——
@@ -423,6 +425,7 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
 | `X-Cline-Pin-Upstreams` | 本次钉住的目标，多个用 `>` 连接 |
 | `X-Cline-Pin-Mode` | `strict` / `preferred` |
 | `X-Cline-Pin-Note` | **仅在未钉死时出现**，说明原因（无规则命中 / 注入失败） |
+| `X-Cline-Pin-Unwrapped` | `data-envelope` 表示还原了 Cline 包封；`skipped-too-large` 表示响应过大未还原 |
 
 上游自己的路由元数据头（`x-*`）也会原样透传，包括 `X-Cline-Actual-Upstream`
 之类的字段——**这就是「抓包确认 finalProvider」的替代品**。
@@ -447,6 +450,13 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
 - **注入失败时降级为未钉死透传**，并在 `X-Cline-Pin-Note` 里注明，避免"以为钉住了"。
 - **上游状态码与响应体原样回传**，调用方的故障转移逻辑才不会失灵。
   因此**不跟随重定向**：30x 连同 `Location` 原样返回，而不是替调用方把 302 跟成 200。
+  **唯一的例外**是下面这条。
+- **非流式 JSON 响应里的 Cline `data` 包封会被还原**。Cline 会把整个补全包起来：
+  `{"data":{...标准补全...},"success":true}`，而几乎全部 OpenAI 客户端只读顶层
+  `choices`，于是表现为「请求成功但没有内容」。代理把它还原成标准形状并打上
+  `X-Cline-Pin-Unwrapped: data-envelope`。只认这一个精确形状，其余一律原样转发；
+  超过 8 MiB 的响应不还原（打 `X-Cline-Pin-Unwrapped: skipped-too-large`）以免吃满内存；
+  可用 `unwrap_data_envelope: false` 完全关闭。**流式响应一个字都不会被缓冲或改写。**
 - **上游中途断开时主动断连**。响应头一旦发出就无法再改成 5xx，如果只是安静返回，
   下游会把残缺内容当成"正常结束"（`Content-Length` 不透传，HTTP 层没有失败信号）。
   代理会以 `http.ErrAbortHandler` 断开连接，客户端因此拿到 `unexpected EOF`。
