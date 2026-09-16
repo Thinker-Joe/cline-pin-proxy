@@ -41,6 +41,18 @@ go test -race ./...                                  # 竞态检测（需 cgo；
 go vet ./...                                         # CI 必查
 gofmt -l .                                           # 必须输出为空
 go test -cover ./...                                 # 覆盖率
+bash scripts/linux-check.sh                           # 在 Linux 容器里跑一遍（见下）
+```
+
+**本项目在 Windows 上开发、在 Linux 上发布**，两者的差异会直接导致编译失败，
+而 Windows 上的 `gofmt` / `go vet` 发现不了。真实踩过的例子：Linux 上
+`syscall.ENOTSUP` 与 `syscall.EOPNOTSUPP` 是同一个常量，`switch` 里同时列出
+就是重复 case，直接编译失败；Windows 上两者却是不同的值，本地一路绿灯。
+
+因此**凡改动涉及 errno 常量、文件权限语义、路径分隔符**，推之前必须跑一次：
+
+```bash
+bash scripts/linux-check.sh     # 需要 Docker，任何平台都能跑
 ```
 
 子命令：`serve`（默认）、`probe`（探测模型可用上游，不消耗 token）、

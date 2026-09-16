@@ -494,7 +494,13 @@ go test -race ./...        # 需要 cgo（例如 Linux CI）
 go vet ./...
 gofmt -l .                 # 应为空
 go test -cover ./...
+bash scripts/linux-check.sh # 在 Linux 容器里跑一遍（需要 Docker）
 ```
+
+> **为什么要有 `linux-check.sh`**：本项目在 Windows 上开发、在 Linux 上发布，
+> 差异会直接导致编译失败。真实踩过：Linux 上 `syscall.ENOTSUP` 与
+> `syscall.EOPNOTSUPP` 是同一个常量，`switch` 里同时列出就是重复 case，
+> 编译不过；Windows 上两者是不同值，本地一路绿灯直到 CI 才炸。
 
 覆盖率：`pin` 94.5% / `admin` 94.9% / `probe` 92.0% / `config` 88.6% / `proxy` 84.7% / `cmd` 22.6%
 （`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支；
