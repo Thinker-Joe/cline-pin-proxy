@@ -1,16 +1,25 @@
 # cline-pin-proxy
 
 把 [Cline Pass](https://cline.bot/cline-pass) 订阅模型背后的**上游渠道钉死**的一个轻量透传代理。
+顺带堵上 Cline 响应包封那道**没人负责的层间缝隙**。
 
 单二进制 Go 程序（源码是多包布局，产物只有一个静态链接的可执行文件），
 **零第三方依赖**，约 2.4k 行源码 + 2.5k 行测试，distroless 镜像约 5 MB。
 
 ```
 你的调用方  ──►  cline-pin-proxy  ──►  Cline Pass  ──►  指定上游
- (sub2api        注入上游偏好            api.cline.bot      deepseek / z-ai / …
-  等任何
-  OpenAI 客户端)
+ (sub2api        ① 注入上游偏好          api.cline.bot      deepseek / z-ai / …
+   等任何        ② 还原响应包封
+   OpenAI 客户端)    （仅非流式）
 ```
+
+**它做两件事：**
+
+1. **钉死上游** —— 双管道注入，绕开「客户端无法控制实际走哪家」的限制（[见下](#它解决什么问题)）。
+2. **还原 Cline 的非标准响应包封** —— Cline 会把非流式补全包进 `data` 壳，而客户端
+   只读顶层 `choices`，结果是**「HTTP 200，但没有内容」**。这是个存在已久、却因为
+   "只影响客户端、不影响计费"而没人修的层间缝隙
+   （[见下](#它还顺手堵上了-cline-的响应包封缝隙)）。
 
 ---
 
@@ -53,6 +62,123 @@ Cline Pass 的订阅模型背后不是单一上游，而是一串第三方推理
 > **direct**、`cline-pass/glm-5.3` 又是 **planner**，管道归属稳定但**逐模型不同**
 > ——这正是必须双写的原因。
 > 完整证据、成本数据与真实测试抓出的 bug 见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。
+
+---
+
+## 它还顺手堵上了 Cline 的响应包封缝隙
+
+这一条不在最初的计划里，是接进真实调用链之后被流量暴露出来的。
+
+**现象**：客户端拿到 `HTTP 200`、`finish_reason: "stop"`、用量也正常，
+**但内容是空的**。没有报错、没有非 200、没有任何失败信号——就是读不出东西。
+
+**原因**：Cline 对**非流式**请求会把整个补全包在一个 `data` 壳里：
+
+```json
+{
+  "data": {
+    "id": "gen_01M2…", "object": "chat.completion", "model": "vmc/k3-contributor-fallbacks",
+    "choices": [ { "index": 0, "message": { "content": "ok", "role": "assistant" },
+                   "finish_reason": "stop" } ],
+    "usage": { "prompt_tokens": 103, "completion_tokens": 16, "total_tokens": 119 }
+  },
+  "success": true
+}
+```
+
+而几乎全部 OpenAI 客户端——官方 SDK、各类网关、形形色色的适配器——都只读**顶层**
+`choices`。顶层没有，就当成"这次没有内容"。
+
+### 影响范围：**所有**走 Cline 的模型，不是某个模型的毛病
+
+实测账号映射的 6 个上游模型名——`cline-pass/deepseek-v4.1-flash`、
+`cline-pass/deepseek-v4-flash`、`cline-pass/deepseek-v4-pro`、`cline-pass/glm-5.3`、
+`cline-pass/glm-5.3-flash`、`cline-pass/kimi-k3`——非流式**无一例外**都带包封。
+
+所以"只有某个模型中招"是**错觉**：那只是**当时恰好只有那个模型被路由到了 Cline 账号**。
+同一个模型名换个账号服务就恢复正常——这正是它难以归因的原因，也说明
+**修复必须做成通用的**，不能只给某个模型打补丁。
+
+### 为什么这个坑藏得很深
+
+三个条件叠在一起，让它极难归因：
+
+1. **只有非流式会这样。** 流式 SSE 的事件是标准形状——上游网关为了计费必须解析
+   SSE，重发时就已经标准化了。于是表现为"同一个模型，流式好好的、非流式没内容"。
+2. **只有请求被路由到 Cline 账号时才出现。** 同一个模型名通常由多个账号共同服务，
+   换一个账号就恢复正常。表现是"时好时坏"，很容易被误判成上游抖动。
+3. **上游网关通常不会修它，因为对计费没有影响。** 以 sub2api 为例：它在源码注释里
+   **明确记录了这个形状**，但兼容只做在用量统计上（读 `data.usage`），
+   **正文仍然原样透传**；它那套「按账号改写响应」的钩子只挂了 Ollama Cloud。
+   站在计费网关的立场这完全合理——用量对得上，职责就完成了。
+
+结果就是：**这是一道没人负责的层间缝隙，而客户端正站在缝隙底下。**
+
+### 本代理的做法
+
+把 `data` 里那层提出来当正文：
+
+```
+Cline 发来：  {"data": { "choices":[…], "usage":{…}, "model":"…" }, "success": true}
+                 └────────────────────┬─────────────────────┘
+回给客户端：            { "choices":[…], "usage":{…}, "model":"…" }
+```
+
+代理本来就在这条链路上，所以这一步放在这里最省事：**任何客户端都能拿到正常响应**，
+不必指望每个下游都自己兼容 Cline 的怪癖，也**不受账号调度变化的影响**
+（明天这个模型换到别的账号服务，行为也不会变）。
+
+### 三条硬约束（这是它敢默认开启的原因）
+
+| 约束 | 做法 |
+|---|---|
+| **只认精确形状** | 顶层无 `choices` + `data` 是对象 + `data.choices` 是非空数组。标准响应、`/v1/models` 的 `data` 数组、错误体、纯数组…一律原样转发（10 组反例测试锁定） |
+| **SSE 一个字节都不缓冲** | 只看 `Content-Type` 是 JSON 才进这条路径。有测试断言"上游仍挂起时下游必须已收到首字节"，防止日后有人为省事把流式也缓冲了 |
+| **超限不静默跳过** | 缓冲上限 8 MiB，超过则原样流式转发并打 `X-Cline-Pin-Unwrapped: skipped-too-large`。宁可还原不了也不 OOM，且**明确告知**——静默跳过会让人以为代理坏了 |
+
+另外：读到一半断开时按既有约定主动断连，不把半截 JSON 当完整响应返回；
+还原后补 `Content-Length`，避免下游按错误长度截断或挂起。
+
+### 实测对照
+
+同一生产环境，**只拨这一个开关**，其他一切不动：
+
+| `unwrap_data_envelope` | 客户端看到 | 结果 |
+|---|---|---|
+| **开启**（默认） | 顶层 `choices` | 正常 |
+| **关闭** | `{"data":{"choices":…},"success":true}` | **读不出内容（复现原始症状）** |
+| 恢复开启 | 顶层 `choices` | 正常 |
+
+包封完全跟着开关走，因此可以排除"只是上游或路由变了"这个替代解释。
+
+### 自己验证
+
+```bash
+# 看开关当前值
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/config | jq .unwrap_data_envelope
+
+# 打一次非流式请求，看顶层有没有 choices
+curl -s -X POST http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CLINE_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/kimi-k3","messages":[{"role":"user","content":"hi"}],"max_tokens":256}' \
+  | jq 'has("choices"), (.choices[0].message.content // "（读不出内容）")'
+
+# 还原发生时响应头会说明
+curl -sD - -o /dev/null -X POST http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CLINE_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/kimi-k3","messages":[{"role":"user","content":"hi"}],"max_tokens":256}' \
+  | grep -i x-cline-pin-unwrapped
+```
+
+> **提示**：验证时把 `max_tokens` 给足（≥256）。推理模型在小预算下会把额度全花在
+> 思考上、正文为空，上游会回 `empty response content`——那是另一回事，
+> 很容易误判成包封问题。
+
+需要严格原样透传的部署可以关掉：
+
+```json
+{ "unwrap_data_envelope": false }
+```
 
 ---
 
@@ -450,13 +576,12 @@ cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
 - **注入失败时降级为未钉死透传**，并在 `X-Cline-Pin-Note` 里注明，避免"以为钉住了"。
 - **上游状态码与响应体原样回传**，调用方的故障转移逻辑才不会失灵。
   因此**不跟随重定向**：30x 连同 `Location` 原样返回，而不是替调用方把 302 跟成 200。
-  **唯一的例外**是下面这条。
-- **非流式 JSON 响应里的 Cline `data` 包封会被还原**。Cline 会把整个补全包起来：
-  `{"data":{...标准补全...},"success":true}`，而几乎全部 OpenAI 客户端只读顶层
-  `choices`，于是表现为「请求成功但没有内容」。代理把它还原成标准形状并打上
-  `X-Cline-Pin-Unwrapped: data-envelope`。只认这一个精确形状，其余一律原样转发；
-  超过 8 MiB 的响应不还原（打 `X-Cline-Pin-Unwrapped: skipped-too-large`）以免吃满内存；
-  可用 `unwrap_data_envelope: false` 完全关闭。**流式响应一个字都不会被缓冲或改写。**
+  **唯一的例外**是下一条（响应体改写），它只针对一个精确形状，详见
+  [Cline 响应包封](#它还顺手堵上了-cline-的响应包封缝隙)。
+- **非流式 JSON 响应里的 Cline `data` 包封会被还原**成标准 OpenAI 形状，
+  并打上 `X-Cline-Pin-Unwrapped: data-envelope`（超 8 MiB 未还原时打
+  `skipped-too-large`）。**流式响应一个字都不会被缓冲或改写。**
+  开关：`unwrap_data_envelope`（默认 `true`）。
 - **上游中途断开时主动断连**。响应头一旦发出就无法再改成 5xx，如果只是安静返回，
   下游会把残缺内容当成"正常结束"（`Content-Length` 不透传，HTTP 层没有失败信号）。
   代理会以 `http.ErrAbortHandler` 断开连接，客户端因此拿到 `unexpected EOF`。
@@ -529,7 +654,10 @@ CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；
 |---|---|---|
 | [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher) | Node 代理 + 控制台 | 功能全（账号池、测速、校验），零依赖。**想开箱即用、要 UI 就选它** |
 | [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) | CLIProxyAPI 插件（Go） | 需要 CPA 进程；双管道注入设计一致 |
-| **本项目** | 单文件 Go 代理 | **只要钉死这一件事**：无账号池、无 UI、无状态，约 5 MB 镜像 |
+| **本项目** | 单文件 Go 代理 | **只做两件事**：钉死上游 + 还原 Cline 的响应包封。无账号池、无 UI、无状态，约 5 MB 镜像 |
+
+> 就目前所见，**响应包封还原这一步没有同类项目做过**。它很容易被当成"上游偶尔抽风"
+> 而放过——因为只影响客户端读不读得到内容，不影响计费，上游网关没有动力修。
 
 本项目的双管道知识来自上述项目的公开实测记录，**未复制其源代码**。
 详见 [NOTICE](NOTICE)。
