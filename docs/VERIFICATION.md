@@ -693,33 +693,22 @@ sub2api 自己的注释就是最权威的说明：
 - 还原后补 `Content-Length`，避免下游按错误长度截断或挂起。
 - 可用 `unwrap_data_envelope: false` 完全关闭，给需要严格原样透传的部署留出口。
 
-### 6. 顺带发现的两处配置漂移（未擅自改动，供决策）
+### 6. 顺带观察到的两处账号配置差异（已知为人工变更，非异常）
 
-对照 2026-09-16 04:03 的账号备份 `cline_pass_accounts_backup_20260916040328.json`：
+对照 2026-09-16 04:03 的账号备份 `cline_pass_accounts_backup_20260916040328.json`，
+有两处差异。**经确认这是有意的人工配置变更**，不是漂移，记录在此只为避免
+后来者误判：
 
-**① 账号 268 的 `model_mapping` 变了**（8 项 → 7 项）：
+- 账号 268 的 `model_mapping` 由 8 项调整为 7 项（`deepseek-v4-flash-pass` 与
+  `deepseek-v4-flash-vision-exp-pass` 移除，`deepseek-v4.1-flash` 新增）。
+- 账号 248 `OpenCode GO - joecoffee`（`kimi-k3 → kimi-k3`）被停用
+  （`schedulable=false`）。
 
-| 备份（04:03） | 现在 |
-|---|---|
-| `deepseek-flash-LJ` → `cline-pass/deepseek-v4.1-flash` | `deepseek-flash` → 同 |
-| `deepseek-v4-flash-pass` → `cline-pass/deepseek-v4-flash` | **已删除** |
-| `deepseek-v4-flash-vision-exp-pass` → `cline-pass/deepseek-v4-flash-vision-exp` | **已删除** |
-| `glm-5.3-flash-solw` → `cline-pass/glm-5.3-flash` | `glm-5.3-flash` → 同 |
-| — | `deepseek-v4.1-flash`（新增） |
+需要注意的**副作用**（也是本次问题的发现路径）：248 停用后，`kimi-k3` 等模型会
+回退到 Cline 账号，因而更容易碰到上面的 `data` 包封。包封还原上线后，
+无论路由怎么变都不再受影响。
 
-如果还有客户端在用 `deepseek-v4-flash-vision-exp-pass` 这类名字，现在会拿不到模型。
-**注意**：`base_url` 的改动不会影响 `model_mapping`，两者是独立的字段。
-
-**② 账号 248 `OpenCode GO - joecoffee` 当前 `schedulable=false`**
-（`base_url` = `https://opencode.ai/zen/go`，映射 `kimi-k3 → kimi-k3`）。
-`last_used_at` 11:09:38、`updated_at` 11:09:48。该账号停用后，`kimi-k3`
-等模型会回退到 Cline 账号——也就是更容易暴露上面的包封问题。
-`schedulable` 是管理 API 可写的字段（`admin_account.go` 的
-`repoUpdates.Schedulable = input.Schedulable`），本次排查中**只对该账号发过 GET**。
-
-**结论**：包封问题**不是** `base_url` 改动引入的，它一直存在；
-但上面两处漂移会改变"哪些请求会走到 Cline"，从而改变这个问题的**暴露频率**。
-建议先把 248 恢复调度（若其凭据仍有效），再决定 268 的映射是否要补回。
+顺带澄清一点：`base_url` 与 `model_mapping` 是**独立字段**，改前者不会影响后者。
 
 ### 7. 仍未验证
 
