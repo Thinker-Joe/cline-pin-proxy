@@ -647,7 +647,58 @@ sub2api 自己的注释就是最权威的说明：
  "success":true}
 ```
 
-### 3. 关键约束：**只有非流式会这样**
+### 3. 范围：**不是只有 kimi-k3 —— Cline 的非流式响应一律带包封**
+
+> ⚠️ **本节结论经过一次修正。** 初版写的是"只有 `kimi-k3` 会出现包封"，
+> 那是**在网关层测的、把路由混进来了**：其他模型当时没被路由到 Cline 账号，
+> 所以看不到包封。下面的直连实验推翻了它。
+
+**直连实验（决定性）**：从服务器直接请求本代理（`127.0.0.1:8787`），
+上游恒为 Cline，逐个测账号 268 映射的全部 6 个上游模型名。
+
+判断依据是响应头 `X-Cline-Pin-Unwrapped` —— 代理已开启还原，包封不会留在
+正文里，但这个头会如实记录"还原发生过"，因此**不需要关掉开关就能测**。
+
+| 上游模型名 | 非流式 | 带图非流式 |
+|---|---|---|
+| `cline-pass/deepseek-v4.1-flash` | **data-envelope** | **data-envelope** |
+| `cline-pass/deepseek-v4-flash` | **data-envelope** | Cline 侧 500（与包封无关） |
+| `cline-pass/deepseek-v4-pro` | **data-envelope** | **data-envelope** |
+| `cline-pass/glm-5.3` | **data-envelope** | Cline 侧 500（与包封无关） |
+| `cline-pass/glm-5.3-flash` | **data-envelope** | **data-envelope** |
+| `cline-pass/kimi-k3` | **data-envelope** | **data-envelope** |
+
+**结论：Cline 对非流式响应**一律**包 `data`，与具体模型无关。**
+
+这解释了为什么 sub2api 的注释把它写成"Cline API 的行为"而不是"某个模型的问题"。
+
+### 3.1 那为什么之前只看到 `kimi-k3` 出问题
+
+因为**只有 kimi-k3 当时被路由到了 Cline 账号**。网关层矩阵（12 个模型）的结果：
+
+- 12 个模型里只有 `kimi-k3` 返回包封
+- 它的落点 `model` 是 `vmc/k3-contributor-fallbacks`（Cline 虚拟模型）
+- 其余模型返回的 `model` 是它们自己的名字（`deepseek-flash`、`glm-5.3-flash`…），
+  说明它们**根本没走 Cline**
+
+用「连发 4 次 `deepseek-flash` + 4 次 `glm-5.3-flash`，再看代理日志」验证：
+**代理零请求** —— 这些请求确实没经过 Cline（只有 base_url 指向代理的账号
+268/301 才会出现在代理日志里）。
+
+所以"哪些模型会中招"完全取决于**当时的账号调度**，而不是模型本身。
+
+### 3.2 一个测量陷阱：max_tokens 太小会伪装成 Cline 故障
+
+直连实验第一轮用了 `max_tokens: 24`，6 个模型里有 5 个返回
+500 `empty response content`。原因不是包封，而是**推理模型把预算全花在思考上、
+正文为空**，Cline 就此报错。把预算提到 512 后全部成功。
+
+排查这类问题时要先排除这个干扰，否则会误判成"上游坏了"。
+
+### 4. 关键约束：**只有非流式会这样**
+
+流式之所以正常，是因为 sub2api 必须解析 SSE 才能计费，重发时就已是标准事件；
+非流式则是原样转发，包封原封不动地漏给客户端。
 
 矩阵探测（模型 × 是否带图 × 是否流式，2026-09-16）：
 
@@ -659,9 +710,6 @@ sub2api 自己的注释就是最权威的说明：
 | `deepseek-flash` | 无 / 有 | 否 / 是 | 标准 |
 | `deepseek-v4.1-flash` | 无 / 有 | 否 / 是 | 标准 |
 | `glm-5.3-flash` | 无 / 有 | 否 / 是 | 标准 |
-
-流式之所以正常，是因为 sub2api 必须解析 SSE 才能计费，重发时就已是标准事件；
-非流式则是原样转发，包封原封不动地漏给客户端。
 
 `kimi-k3` 在账号 268（Cline Pass）映射为 `cline-pass/kimi-k3`——确认走 Cline。
 
@@ -694,7 +742,6 @@ sub2api 自己的注释就是最权威的说明：
 - 可用 `unwrap_data_envelope: false` 完全关闭，给需要严格原样透传的部署留出口。
 
 ### 6. 顺带观察到的两处账号配置差异（已知为人工变更，非异常）
-
 对照 2026-09-16 04:03 的账号备份 `cline_pass_accounts_backup_20260916040328.json`，
 有两处差异。**经确认这是有意的人工配置变更**，不是漂移，记录在此只为避免
 后来者误判：
