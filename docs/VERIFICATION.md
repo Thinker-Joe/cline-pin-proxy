@@ -647,6 +647,95 @@ sub2api 自己的注释就是最权威的说明：
  "success":true}
 ```
 
+### 2.1 代码级核实：机制存在，但 Cline 没被接进去
+
+（2026-09-16 复核，对照线上运行的 `0.2.5` / `86f93c28e`；本地 checkout
+`881f32026` 是它的直接子提交，只多一个 VERSION sync。）
+
+**非流式 Chat Completions 的响应路径**是
+`openai_gateway_chat_completions_raw.go` 的 `bufferRawChatCompletions()`。
+它读完上游 body 后，**对 body 的赋值只有一处**：
+
+```go
+respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+if parsedUsage, ok := extractOpenAIUsageFromJSONBytes(respBody); ok {   // 只读，取用量
+	usage = parsedUsage
+}
+responseModel := gjson.GetBytes(respBody, "model").String()             // 只读顶层 model
+respBody = applyOllamaCloudRawChatCompletionsResponse(account, respBody) // ★ 唯一的改写
+c.Writer.WriteHeader(http.StatusOK)
+_, _ = c.Writer.Write(respBody)                                        // 原样写出
+```
+
+**所以 sub2api 确实有"按账号改写响应"的钩子框架，而且它正是 base_url 驱动的** ——
+只是**只挂了 Ollama Cloud**。全仓一共 3 个同类钩子，无一例外：
+
+| 钩子 | 作用点 |
+|---|---|
+| `applyOllamaCloudRawChatCompletionsRequest` | 请求体 |
+| `applyOllamaCloudRawChatCompletionsResponse` | 非流式响应体 |
+| `applyOllamaCloudRawChatCompletionsSSELine` | 流式 SSE 每一行 |
+
+判定条件里就有 URL 识别：
+
+```go
+func isOllamaCloudBaseURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	...
+	hostname := strings.ToLower(parsed.Hostname())
+	return hostname == "ollama.com" || hostname == "www.ollama.com"
+}
+```
+
+同类模式在别处也有，同样是 base_url 驱动：
+
+```go
+// account.go GetCodingPlanProvider()
+case strings.Contains(baseURL, "api.kimi.com/coding"):   return PlatformKimi
+case strings.Contains(baseURL, "bigmodel.cn"),
+     strings.Contains(baseURL, "api.z.ai"):              return PlatformZhipu
+case strings.Contains(baseURL, "minimax.io"), ...:       return PlatformMiniMax
+```
+
+**但没有任何针对 Cline 的钩子。** 补充证据：
+
+- 全仓没有把 `data` 层提出来当正文的代码（`grok_observed_models.go`、
+  `openai_images_b64_backfill.go` 是 models / images 端点，与补全无关）
+- `replaceModelInResponseBody()` 只用 `gjson.GetBytes(body, "model")`（顶层），
+  包封下**静默失效**——这正解释了为什么包封响应里漏出的是 Cline 的上游模型名
+  （`vmc/k3-contributor-fallbacks`）而不是客户端请求的名字
+
+**结论（准确版）**：
+
+| 环节 | 状态 |
+|---|---|
+| 用量统计 | ✅ 处理了（`data.usage` 在候选路径里） |
+| 按账号改写响应的框架 | ✅ 存在，且是 base_url 驱动 |
+| **Cline 的正文还原** | ❌ **没接** |
+
+不是"完全没处理"，而是**框架在、Cline 缺一个挂载点**。
+
+### 2.2 顺带发现：账号 248 的 platform 没走 OpenCode Go 通道
+
+sub2api 有**一等公民级的 OpenCode Go 平台支持**：
+
+```
+PlatformOpenCodeGo = "opencode_go"
+AccountModeZen    = "zen"   // https://opencode.ai/zen/v1
+AccountModeGo     = "go"    // https://opencode.ai/zen/go/v1
+DefaultOpenCodeGoModelIDs() / ResolveOpenCodeGoProtocol() / 专用额度窗口
+```
+
+判定是 `IsOpenCodeGo() { return a.Platform == PlatformOpenCodeGo }`。
+
+而账号 248 `OpenCode GO - joecoffee` 的 **`platform` 是 `openai`**，
+base_url 是 `https://opencode.ai/zen/go` —— 也就是**它绕过了这条专用通道**，
+被当成普通 OpenAI 兼容账号处理。
+
+⚠️ 注意：**即使把它改成 `opencode_go` 也不解决包封问题** —— 那条通道管的是
+协议选择（Chat / Anthropic / Responses）与额度窗口，不含响应正文还原。
+但它影响模型列表、协议路由与额度统计，值得单独确认是否有意为之。
+
 ### 3. 范围：**不是只有 kimi-k3 —— Cline 的非流式响应一律带包封**
 
 > ⚠️ **本节结论经过一次修正。** 初版写的是"只有 `kimi-k3` 会出现包封"，
