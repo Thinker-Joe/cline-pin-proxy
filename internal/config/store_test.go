@@ -1,12 +1,15 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -490,4 +493,78 @@ func TestWatchDoesNothingWithoutPath(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Watch should return immediately when there is no config file")
 	}
+}
+
+// syncBuffer 让测试能在 watcher 还在写的时候安全地读日志。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) count(sub string) int {
+	return strings.Count(b.String(), sub)
+}
+
+// 坏配置会在每个轮询周期重复失败。实测（2026-09-16，真实服务器）25 秒内
+// 刷了 5 条一模一样的 WARN——每 5 秒一条，很快就把日志淹了。
+// 同一个错误只报一次，修好后再报一次恢复。
+func TestWatchLogsRepeatedFailureOnlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeFile(t, path, `{"rules":[]}`)
+
+	logs := &syncBuffer{}
+	s, err := NewStore(path, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Watch(ctx, 10*time.Millisecond)
+
+	// 连续写两次坏配置、中间隔开若干轮询周期，仍然只该有一条告警。
+	writeFile(t, path, `{ bad one`)
+	waitFor(t, 2*time.Second, func() bool { return logs.count("config reload failed") >= 1 })
+	writeFile(t, path, `{ bad two`)
+	time.Sleep(150 * time.Millisecond) // 十几个轮询周期
+	if n := logs.count("config reload failed"); n != 1 {
+		t.Errorf("failure logged %d times, want 1\n%s", n, logs.String())
+	}
+	// 期间配置必须保持可用。
+	if s.Current() == nil {
+		t.Fatal("config must stay usable while the file is broken")
+	}
+
+	// 修好后应当重新加载，并明确报一次恢复。
+	writeFile(t, path, `{"rules":[{"name":"fixed","model":"glm-5.3","upstreams":["friendli"]}]}`)
+	waitFor(t, 2*time.Second, func() bool { return logs.count("config reload recovered") == 1 })
+	waitFor(t, 2*time.Second, func() bool { return logs.count("config reloaded") == 1 })
+	if got := s.Current().Rules[0].Name; got != "fixed" {
+		t.Errorf("rules = %q, want fixed", got)
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %s", timeout)
 }

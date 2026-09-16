@@ -277,14 +277,45 @@ func TestPutRulesRejectsMalformedAndUnknownFields(t *testing.T) {
 	mux, _ := newTestHandler(t, testConfig("t"), &fakeProber{})
 
 	for name, body := range map[string]string{
-		"malformed":        `{oops`,
-		"unknown field":    `{"rules":[],"bogus":1}`,
-		"wrong field name": `{"rule":[]}`,
+		"malformed":            `{oops`,
+		"unknown field":        `{"rules":[],"bogus":1}`,
+		"wrong field name":     `{"rule":[]}`,
+		"object without rules": `{}`,
+		"empty body":           ``,
+		"trailing data":        `[{"name":"a","model":"m","upstreams":["x"]}] oops`,
+		"scalar body":          `"nope"`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := do(t, mux, http.MethodPut, "/admin/rules", body, bearer("t"))
 			if rec.Code != http.StatusBadRequest {
-				t.Errorf("status = %d, want 400", rec.Code)
+				t.Errorf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// 裸数组与 {"rules":[...]} 两种写法都必须接受。
+//
+// 这不是洁癖：实测中 README 写的是裸数组、实现只认包装形式，调用方
+// 要先吃一个 400 才知道该用哪种。两种都收掉这个坑。
+func TestPutRulesAcceptsBareArrayAndWrappedObject(t *testing.T) {
+	rule := `{"name":"glm","model":"glm-5.3","match":"contains","pipeline":"auto","mode":"strict","upstreams":["friendli"]}`
+	for name, body := range map[string]string{
+		"bare array":                             `[` + rule + `]`,
+		"wrapped object":                         `{"rules":[` + rule + `]}`,
+		"bare array with surrounding whitespace": "\n  [ " + rule + " ]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeStore{cfg: testConfig("t"), persisted: true}
+			mux := http.NewServeMux()
+			NewHandler(store, &fakeProber{}, nil).Register(mux)
+
+			rec := do(t, mux, http.MethodPut, "/admin/rules", body, bearer("t"))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if len(store.setRules) != 1 || store.setRules[0].Name != "glm" {
+				t.Errorf("rules not forwarded: %+v", store.setRules)
 			}
 		})
 	}

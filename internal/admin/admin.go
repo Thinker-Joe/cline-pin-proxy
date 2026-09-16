@@ -8,9 +8,11 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -130,15 +132,13 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"rules": h.store.Current().Rules})
 
 	case http.MethodPut:
-		var body struct {
-			Rules []config.Rule `json:"rules"`
-		}
-		if err := decodeJSON(r, &body); err != nil {
+		rules, err := decodeRules(r)
+		if err != nil {
 			badRequest(w, err.Error())
 			return
 		}
 
-		persisted, persistErr, err := h.store.SetRules(body.Rules)
+		persisted, persistErr, err := h.store.SetRules(rules)
 		if err != nil {
 			// 校验失败时不改动任何状态，调用方可以修正后重试。
 			badRequest(w, err.Error())
@@ -146,7 +146,7 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.log.Info("rules updated via admin api",
-			"count", len(body.Rules), "persisted", persisted)
+			"count", len(rules), "persisted", persisted)
 
 		resp := map[string]any{
 			"ok":        true,
@@ -224,12 +224,64 @@ func (h *Handler) handleReload(w http.ResponseWriter, r *http.Request) {
 // 小工具
 // ---------------------------------------------------------------------------
 
+// decodeRules 解析 PUT /admin/rules 的请求体，接受两种写法：
+//
+//	[ {...}, {...} ]              // 裸数组——这个端点名下最自然的写法
+//	{ "rules": [ {...} ] }        // 包装形式，与 GET 的响应结构对称
+//
+// 两种都收：只认其中一种的话，调用方要先吃一个 400 才知道该用哪种，
+// 而实测中这确实发生了（README 写裸数组、实现只认包装形式）。
+func decodeRules(r *http.Request) ([]config.Rule, error) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxAdminBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read request body: %w", err)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, errors.New("empty request body")
+	}
+
+	body := raw
+	if trimmed := bytes.TrimSpace(raw); trimmed[0] == '{' {
+		var wrapper struct {
+			Rules []config.Rule `json:"rules"`
+		}
+		if err := unmarshalStrict(trimmed, &wrapper); err != nil {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		if wrapper.Rules == nil {
+			return nil, errors.New(`invalid JSON body: object form requires a "rules" array`)
+		}
+		return wrapper.Rules, nil
+	}
+
+	var rules []config.Rule
+	if err := unmarshalStrict(body, &rules); err != nil {
+		return nil, fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return rules, nil
+}
+
 // decodeJSON 严格解析请求体：限制体积并拒绝未知字段，避免拼错的参数被静默忽略。
 func decodeJSON(r *http.Request, dst any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxAdminBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
+
+// unmarshalStrict 与 decodeJSON 同样的严格语义，但作用于已在内存里的字节。
+func unmarshalStrict(raw []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	// 拒绝 `[...] garbage` 这种「合法 JSON 后面还拖着东西」的输入。
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected trailing data after JSON value")
 	}
 	return nil
 }

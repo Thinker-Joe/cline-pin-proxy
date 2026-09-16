@@ -231,8 +231,8 @@ cp config.example.json config.json      # Docker 部署则是 data/config.json
 改配置文件即生效，**不需要重启进程，也不需要重建容器**：
 
 ```bash
-# 直接编辑挂载出来的文件
-vim data/config.json
+# 直接编辑挂载出来的文件（文件属主是容器用户时用 sudo tee，别用会改属主的编辑器）
+sudo vim data/config.json
 ```
 
 进程按 `watch_seconds` 轮询文件修改时间，发现变化就重新解析并原子替换生效配置。
@@ -245,11 +245,13 @@ vim data/config.json
 两个安全约定：
 
 - **解析失败不会导致中断**。坏配置被拒绝，**上一份好配置继续生效**，同时打 WARN 日志。
+  同一个错误只告警一次（否则每 5 秒一条会在几分钟内刷满日志），文件修好后打一条
+  `config reload recovered` 并自动接管。
 - **文件被删除也不会中断**。配置回落到上次成功的值，等文件重新出现后再接管。
 
-> 为什么不做成 `docker compose restart`：容器重启只能重读**镜像里**的配置，
-> 挂载文件的内容变化 compose 是察觉不到的。没有热重载就得 `--force-recreate`，
-> 而它对「改一个 slug 试试速度」这种高频操作太重了。
+> 为什么值得做这个：`docker compose up -d` 察觉不到挂载文件的内容变化，不会重建容器，
+> 改完配置毫无反应，是个很容易误判成「配置没写对」的坑。`restart` 虽然能生效，
+> 但要中断一次服务；对「换个 slug 试试速度」这种高频操作，热重载几乎是无成本的。
 
 ### 管理 API
 
@@ -272,7 +274,7 @@ TOKEN=$(python3 -c 'import json;print(json.load(open("data/config.json"))["admin
 # 看看现在钉的是什么
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/admin/rules | jq
 
-# 热更新规则（不需要重启）
+# 热更新规则（不需要重启）。裸数组和 {"rules":[...]} 两种写法都收。
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
      -d '[{"name":"glm","model":"glm-5.3","match":"contains","mode":"strict","upstreams":["friendli"]}]' \
@@ -437,7 +439,7 @@ gofmt -l .                 # 应为空
 go test -cover ./...
 ```
 
-覆盖率：`admin` 96.0% / `pin` 96.1% / `probe` 92.0% / `config` 88.6% / `proxy` 84.1%
+覆盖率：`pin` 96.1% / `admin` 95.2% / `probe` 92.0% / `config` 89.7% / `proxy` 84.1%
 （`config` 未覆盖的主要是 `Sync`/`Close` 失败这类需要故障注入才走得到的分支）。
 
 CI 在每次 push 与 PR 上跑 `gofmt` + `vet` + `test -race`；

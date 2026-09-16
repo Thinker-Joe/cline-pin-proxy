@@ -276,6 +276,10 @@ func (s *Store) Watch(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// 坏配置会在每个轮询周期重复失败。每次都打 WARN 会在几分钟内刷满日志，
+	// 反而盖住别的信息；同一个错误只报一次，恢复时再报一次。
+	var lastErr string
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -283,9 +287,17 @@ func (s *Store) Watch(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			changed, err := s.ReloadIfChanged()
 			if err != nil {
-				s.log.Warn("config reload failed, keeping previous rules",
-					"path", s.path, "error", err)
+				if msg := err.Error(); msg != lastErr {
+					lastErr = msg
+					s.log.Warn("config reload failed, keeping previous rules",
+						"path", s.path, "error", err,
+						"hint", "同一个错误不会重复告警；文件修好后会自动重新加载")
+				}
 				continue
+			}
+			if lastErr != "" {
+				s.log.Info("config reload recovered", "path", s.path)
+				lastErr = ""
 			}
 			if changed {
 				cfg := s.Current()
