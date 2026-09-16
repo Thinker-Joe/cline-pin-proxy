@@ -240,6 +240,11 @@ func (s *Store) persistRulesLocked(rules []Rule) error {
 //
 // 只有前者才允许退化为原地覆盖：原地写不具备原子性（写到一半断电会留下
 // 半个文件），是明确的取舍，不能因为任何一次写失败就启用。
+//
+// 注意不要在这里同时列出 syscall.ENOTSUP 与 syscall.EOPNOTSUPP：Linux 上
+// 两者是同一个常量，switch 会因重复 case 直接编译失败（Windows 上却是两个
+// 不同的值，本地 vet 发现不了）。改用 errors.ErrUnsupported 表达"不支持"，
+// syscall.Errno.Is 已经替我们处理了这两个别名。
 func isAtomicReplaceUnavailable(err error) bool {
 	if err == nil {
 		return false
@@ -247,13 +252,11 @@ func isAtomicReplaceUnavailable(err error) bool {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		switch errno {
-		case syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EXDEV,
-			syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOSYS:
+		case syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EXDEV:
 			return true
 		}
-		return false
 	}
-	return errors.Is(err, os.ErrPermission)
+	return errors.Is(err, errors.ErrUnsupported) || errors.Is(err, os.ErrPermission)
 }
 
 // writeAtomic 用同目录临时文件 + rename 原子替换配置，返回临时文件名。

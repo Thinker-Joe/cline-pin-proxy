@@ -200,6 +200,10 @@ func TestAtomicFallbackIsRestrictedToUnavailableCases(t *testing.T) {
 		&os.PathError{Op: "open", Path: "/x", Err: syscall.EROFS},
 		&os.PathError{Op: "rename", Path: "/x", Err: syscall.EXDEV},
 		syscall.EACCES,
+		// 不支持类错误统一走 errors.ErrUnsupported（见函数注释：不能在 switch 里
+		// 同时列 ENOTSUP 与 EOPNOTSUPP，Linux 上那是重复 case，直接编译失败）。
+		&os.PathError{Op: "rename", Path: "/x", Err: syscall.ENOSYS},
+		errors.ErrUnsupported,
 	}
 	contentFailures := []error{
 		&os.PathError{Op: "write", Path: "/x", Err: syscall.ENOSPC},
