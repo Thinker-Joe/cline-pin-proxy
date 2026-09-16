@@ -213,6 +213,13 @@ func (s *Store) persistRulesLocked(rules []Rule) error {
 
 // writeAtomic 用同目录临时文件 + rename 原子替换配置，返回临时文件名。
 func (s *Store) writeAtomic(out []byte) (string, error) {
+	// 沿用原文件权限：配置里可能含 admin_token，把 0600 改写成 0644
+	// 等于在运维者不知情的情况下降权。
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(s.path); err == nil {
+		mode = info.Mode().Perm()
+	}
+
 	dir := filepath.Dir(s.path)
 	tmp, err := os.CreateTemp(dir, ".config-*.json")
 	if err != nil {
@@ -232,7 +239,7 @@ func (s *Store) writeAtomic(out []byte) (string, error) {
 	if err := tmp.Close(); err != nil {
 		return tmpName, fmt.Errorf("close temp config: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, mode); err != nil {
 		return tmpName, fmt.Errorf("chmod temp config: %w", err)
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {

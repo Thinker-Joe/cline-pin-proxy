@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -414,6 +415,36 @@ func TestSetRulesReportsBothPersistFailures(t *testing.T) {
 	}
 	if s.Current().Rules[0].Name != "n" {
 		t.Error("rules should still apply in memory when persist fails")
+	}
+}
+
+// 配置里可能含 admin_token，写回时必须沿用原权限，
+// 不能把运维者设的 0600 悄悄改写成 0644。
+func TestSetRulesPreservesFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不保留 POSIX 权限位")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeFile(t, path, `{"rules":[]}`)
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := NewStore(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, persistErr, err := s.SetRules([]Rule{{Name: "n", Model: "m", Upstreams: []string{"a"}}})
+	if err != nil || !persisted || persistErr != nil {
+		t.Fatalf("SetRules: persisted=%v persistErr=%v err=%v", persisted, persistErr, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %o, want 600", got)
 	}
 }
 
