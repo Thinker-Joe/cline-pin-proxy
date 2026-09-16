@@ -359,11 +359,140 @@ https://api.cline.bot/api/v1/v1/chat/completions   →  404 Not Found
 - **未覆盖流式下的钉死**：真实请求都是 `stream: false`。流式透传的「逐块 Flush」
   有单测覆盖（用真实 socket 断言首块在上游仍挂起时就已到达），但没有对着真实
   网关跑过流式钉死。
-- **`sort` 参数未实测**：`cost` / `ttft` / `tps` 三种排序只在单测里验证了编码
-  正确，没有对真实网关验证其效果。
 - **上游 slug 会变**：Cline 侧渠道池随时可能调整，本文清单是 2026-09-16 的快照，
   上线前请自行 `probe` 复核。
 - **依赖 Cline 网关的错误措辞**：`probe` 的解析建立在 `from Vercel` / `from
   Openrouter` 与 `available_providers` / `Available providers are` 这些措辞之上。
   措辞变化时 `probe` 会返回空清单并打印原始片段（已验证该降级路径），
   但不会自动适配。
+
+---
+
+## 十一、配置热重载与管理 API（2026-09-16，真实服务器实测）
+
+**为什么做这次迭代**：此前改规则只能「编辑 `config.json` + 重启进程」，而 Docker
+部署下这条路是断的——`docker compose up -d` 察觉不到挂载文件的内容变化，不会重建
+容器，改完毫无反应，很容易误判成「配置没写对」。同时 distroless 镜像里没有 shell，
+`probe` 只能靠 `docker run --rm --entrypoint` 绕一圈。两者都变成可脚本化的能力。
+
+**环境**：腾讯云-硅谷 `170.106.176.16`，`/opt/cline-pin-proxy`，compose 挂载
+`./data:/etc/cline-pin-proxy`。镜像 `sha256:d8f7302d04a4…`（`v0.3` 一代），
+运行参数 `watch_seconds=5`，`admin_api="enabled (token required)"`。
+
+### 1. 热重载确实不需要重启进程（决定性证据）
+
+```
+PID 基线: 3284619   规则数: 3
+
+# 直接在宿主机上改挂载出来的文件，加第 4 条规则，全程不碰容器
+规则数: 4           ← 9 秒后（1~2 个轮询周期）
+PID:    3284619     ← 与基线相同
+```
+
+日志：`msg="config reloaded" rules=4 watch_seconds=5`
+
+**PID 全程未变**，这是「热重载」区别于「重启后重新读配置」的关键证据。
+本次验证从部署到结束共经历：加规则 → 写坏 → 恢复 → PUT 落盘 → PUT 复原，
+`PID` 始终是 `3284619`。
+
+### 2. 坏配置不会中断服务，且告警不刷屏
+
+写入 `{ this is not json` 后：
+
+| 观察项 | 结果 |
+|---|---|
+| 生效规则数 | **4**（上一份好配置继续生效） |
+| `/healthz` | **200** |
+| 22 秒（约 4 个轮询周期）内的 WARN 条数 | **1** |
+| 文件改回合法后 | 自动接管，打出 `config reload recovered` + `config reloaded rules=3` |
+
+### 3. 管理 API 鉴权与密钥卫生
+
+| 请求 | 结果 |
+|---|---|
+| 无认证 `GET /admin/rules`（已设令牌） | **401** |
+| 错误令牌 | **401** |
+| `Authorization: Bearer <token>` | **200** |
+| `X-Admin-Token: <token>` | **200** |
+| `DELETE /admin/rules` | **405** + `Allow: GET, PUT` |
+| 非法规则（`strict` 但无 `upstreams`） | **400** |
+| 未知字段 / 畸形 JSON / 对象形式缺 `rules` / 尾部拖数据 | **400** |
+| 未设令牌且未开 `admin_allow_unauthenticated` | **404**（单测覆盖，非 403） |
+
+`GET /admin/config` 返回 **617 字节**，断言通过：
+
+- 不包含 `admin_token` 的值；
+- 连 `api_key` **字段本身都不返回**，只回 `admin_auth_required: true`。
+
+### 4. `PUT /admin/rules` 真的会落盘，且不破坏其余配置
+
+```
+PUT 裸数组 4 条 → applied=True persisted=True rules=4
+  文件规则名     : ['deepseek', 'glm-5.3-flash', 'glm-5.3', 'put-persist-check']
+  文件权限/属主  : 600 65532:65532        ← 权限位与属主均被保留
+  进程级字段保留 : listen upstream watch_seconds admin_token api_key 全部仍在
+
+PUT 裸数组 3 条 → applied=True persisted=True
+  文件规则名     : ['deepseek', 'glm-5.3-flash', 'glm-5.3']
+```
+
+### 5. 全链路仍然通（sub2api → 本代理 → Cline Pass）
+
+用 `POST /api/v1/admin/accounts/:id/test` 对两个 Cline Pass 账号逐个模型发真实请求：
+
+| 账号 | 模型 | 结果 |
+|---|---|---|
+| 268 `Cline Pass - fdvvcc` | `cline-pass/glm-5.3` | ✅ 返回 `ok` |
+| 268 | `cline-pass/glm-5.3-flash` | ✅ 返回 `ok` |
+| 268 | `cline-pass/deepseek-v4.1-flash` | ✅ 返回 `ok` |
+| 301 `Cline Pass - fdvvcc - free` | `cline-pass/glm-5.3-flash` | ✅ 返回 `ok` |
+| 301 | `cline-pass/deepseek-v4.1-flash` | ✅ 返回 `ok` |
+
+代理侧同期日志（证明流量确实经过代理且被钉死，而不是绕过了它）：
+
+```
+20  cline-pass/deepseek-v4.1-flash -> deepseek        (deepseek)
+10  cline-pass/deepseek-v4-flash   -> deepseek        (deepseek)
+ 4  cline-pass/glm-5.3-flash       -> glm-5.3-flash   (relace)
+ 2  cline-pass/glm-5.3             -> glm-5.3         (friendli)
+```
+
+**无一条未命中规则，无一条注入失败。**
+
+### 6. 本轮真实测试抓出的 bug（单测均未覆盖）
+
+#### (1) `PUT /admin/rules` 只认包装形式，而文档写的是裸数组
+
+实现要求 `{"rules":[...]}`，README 与 curl 示例写的却是 `[...]`：
+
+```
+{"error":{"message":"invalid JSON body: json: cannot unmarshal array into Go value
+ of type struct { Rules []config.Rule \"json:\\\"rules\\\"\" }","type":"invalid_request_error"}}
+```
+
+调用方要先吃一个 400 才知道该用哪种写法。**修复**：两种都接受，并补测试锁定；
+同时拒绝 `[...] garbage` 这种尾部拖数据的输入。
+
+#### (2) 坏配置每 5 秒重复告警
+
+`watch_seconds=5` 下，坏文件每个轮询周期都打一条一模一样的 WARN，
+实测 22 秒 4 条、此前 25 秒 5 条，几分钟就能把日志淹掉。**修复**：同一个错误
+只报一次，恢复时补一条 `config reload recovered`。
+（修复前/后的对照已在 §2 用真实计数器确认。）
+
+#### (3) 写回会把文件权限降级
+
+原子替换时硬编码 `0644`。配置里现在可能有 `admin_token`，这等于在运维者
+不知情的情况下把 `0600` 的私密配置降成全局可读。**修复**：沿用原文件的权限位。
+
+### 7. 一个刻意的语义不对称（易踩，记在这里）
+
+| 场景 | 启动时 | 运行期 |
+|---|---|---|
+| 配置文件**不存在** | 以默认值 + 环境变量启动，保留路径等文件出现 | 文件出现后自动接管 |
+| 配置文件**存在但非法** | **启动失败** | 保留上一份好配置 + WARN，不中断 |
+
+理由：文件缺失是「还没配」，可以合理降级；文件非法是「配错了」，
+启动时静默降级会让人以为规则生效了。**代价**：如果文件被写坏且此刻重启容器，
+容器起不来——这是有意的失败快速，但运维上要知道。
+
