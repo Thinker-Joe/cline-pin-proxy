@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-A Go proxy that selects inference providers for models served through the Cline API and converts Cline's wrapped JSON completions to the OpenAI response format. Provider selection supports model IDs with or without the `cline-pass/` prefix, where the model honors Cline's routing fields.
+A Go proxy that makes the Cline API use a chosen inference provider for a given model, and converts Cline's `data`-wrapped JSON completions into the OpenAI response format. Rules match model IDs with or without the `cline-pass/` prefix; whether routing takes effect depends on the model honoring Cline's routing fields.
 
 It builds into one executable, uses only the Go standard library, and supports streaming responses, configuration reloads, and an optional admin API.
 
@@ -12,93 +12,90 @@ OpenAI-compatible client → cline-pin-proxy → Cline API → inference provide
 
 ## Quick start
 
-### Docker Compose
+The image needs Docker with the Compose v2 plugin (`docker compose version`) — no source checkout and no Go toolchain. It supports `linux/amd64` and `linux/arm64`. The commands below use Bash.
 
-Requires Docker with the Compose v2 plugin (`docker compose version`). Copy the files below into a deployment directory; no repository checkout or local Go installation is needed. The image supports `linux/amd64` and `linux/arm64`. The commands below use Bash.
-
-**1. Create the deployment directory and Compose file.**
-
-```bash
-mkdir -p cline-pin-proxy/data
-cd cline-pin-proxy
-```
-
-Save the following as `docker-compose.yaml`. It uses the same settings as the repository's [docker-compose.yml](docker-compose.yml):
+**1. Save this as `docker-compose.yaml`.**
 
 ```yaml
 services:
   cline-pin-proxy:
     image: ghcr.io/thinker-joe/cline-pin-proxy:latest
-    container_name: cline-pin-proxy
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
-    environment:
-      CLINE_PIN_UPSTREAM: ${CLINE_PIN_UPSTREAM:-}
-      CLINE_PIN_API_KEY: ${CLINE_PIN_API_KEY:-}
-      CLINE_PIN_FORWARD_HEADERS: ${CLINE_PIN_FORWARD_HEADERS:-}
-      CLINE_PIN_LOG_LEVEL: ${CLINE_PIN_LOG_LEVEL:-info}
-    volumes:
-      - ./data:/etc/cline-pin-proxy
-    command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/cline-pin-proxy", "healthcheck", "-url", "http://127.0.0.1:8787/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp
+    # environment:
+    #   CLINE_PIN_API_KEY: "sk-..."   # optional: one shared upstream key for all requests
 ```
 
-**2. Create the configuration.**
+No configuration file is required: the [default rules](#default-rules) apply, and each client sends its own Cline API key. The image sets `CLINE_PIN_LISTEN=0.0.0.0:8787` so that port publishing works, and includes a healthcheck.
 
-Save the following as `data/config.json`. Keep any existing configuration if you are updating a deployment.
-
-```json
-{
-  "api_key": "",
-  "admin_token": ""
-}
-```
-
-Omitting `rules` keeps the [default rules](#default-rules); other omitted fields use application defaults. Each client supplies its own Cline API key. To use one upstream key for all requests, fill in `api_key`. Set `admin_token` only if you need the [admin API](#admin-api).
-
-**3. Start and check the service.**
+**2. Start and check it.**
 
 ```bash
-docker compose pull
 docker compose up -d --wait
-docker compose ps
 curl -fsS http://127.0.0.1:8787/healthz
 ```
 
-`--wait` waits for the container healthcheck to pass. The endpoint returns `{"status":"ok"}`; it checks the proxy process, not upstream availability. If startup fails, inspect `docker compose logs --tail=100 cline-pin-proxy`.
+`--wait` returns once the container healthcheck passes. The endpoint returns `{"status":"ok"}` and checks the proxy process, not upstream availability. If startup fails, run `docker compose logs --tail=100 cline-pin-proxy`.
 
-**4. Connect a client.**
+**3. Point a client at it.**
 
-Use `http://127.0.0.1:8787/v1` as the Base URL and your Cline API key as the API key. See the [test request](#client-configuration) below. Port 8787 is published only on the Docker host's loopback interface. For a client in another container, use a shared Docker network and `http://cline-pin-proxy:8787/v1`; see [sub2api integration](#sub2api-integration).
+Any client that lets you set an OpenAI-compatible base URL can use the proxy: replace Cline's API base URL `https://api.cline.bot/api/v1` with the proxy URL and change nothing else — the API key and model names stay as they are.
 
-**Manage the deployment.** Run these commands from the directory containing your Compose file:
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8787/v1` (replacing `https://api.cline.bot/api/v1`) |
+| API key | Your Cline API key; any non-empty value when `CLINE_PIN_API_KEY` is set |
+| Model | `cline-pass/deepseek-v4.1-flash` |
+
+Model IDs are preserved and models without a matching rule are forwarded unchanged, so existing model names keep working. Port 8787 is published only on the Docker host's loopback interface. For a client in another container, connect both to a shared Docker network and use `http://cline-pin-proxy:8787/v1`; see [sub2api integration](#sub2api-integration).
+
+Test request:
+
+```bash
+export CLINE_KEY='<your Cline API key>'
+curl -i http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CLINE_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":512}'
+```
+
+By default the proxy forwards the client's `Authorization` header. A fixed `api_key`/`CLINE_PIN_API_KEY` replaces client credentials; it does **not** add authentication to the proxy's own API routes.
+
+**Managing the container.** Run these from the directory containing your Compose file:
 
 | Task | Command |
 |---|---|
 | View status | `docker compose ps` |
 | Follow logs | `docker compose logs -f --tail=100 cline-pin-proxy` |
-| Stop temporarily | `docker compose stop` |
-| Start again | `docker compose start` |
-| Restart the process | `docker compose restart cline-pin-proxy` |
-| Remove the container and Compose network | `docker compose down` |
+| Stop / start | `docker compose stop` / `docker compose start` |
+| Remove container and Compose network | `docker compose down` |
 
-The host directory `data/` is mounted at `/etc/cline-pin-proxy` in the container and remains after `docker compose down`. Edit `data/config.json` to change rules; most settings reload within five seconds by default. See [reloading](#reloading) for startup-only settings and environment overrides.
+To update the image, pull it and recreate the service. This briefly interrupts service:
+
+```bash
+docker compose pull
+docker compose up -d --wait
+```
+
+`docker compose restart` does not switch to a newly pulled image. To build from local source instead, use a repository checkout, uncomment `build: .` in its `docker-compose.yml`, and run `docker compose up -d --build --wait`.
+
+### Persistent configuration
+
+Add this only for custom rules, the admin API, or settings you want to keep across container recreation. The repository's [docker-compose.yml](docker-compose.yml) is the hardened version (data mount, read-only root filesystem, log rotation); its mount and command are:
+
+```yaml
+    volumes:
+      - ./data:/etc/cline-pin-proxy
+    command: ["serve", "-config", "/etc/cline-pin-proxy/config.json"]
+```
+
+```bash
+mkdir -p data && cp config.example.json data/config.json
+docker compose up -d --wait
+```
+
+[config.example.json](config.example.json) matches the built-in defaults. Omitting `rules` keeps the [default rules](#default-rules); other omitted fields use application defaults. The file is polled, and most settings reload within five seconds ([Reloading](#reloading)). The `data/` directory survives `docker compose down`.
 
 Validate the file and preview a rule using the running container:
 
@@ -107,123 +104,16 @@ docker compose exec cline-pin-proxy /usr/local/bin/cline-pin-proxy \
   check -config /etc/cline-pin-proxy/config.json -model deepseek/deepseek-v4-flash
 ```
 
-To update the image, pull it and recreate the service. This briefly interrupts service and keeps `data/`:
-
-```bash
-docker compose pull
-docker compose up -d --wait
-```
-
-`docker compose restart` does not switch to a newly pulled image. For a local source build, use a repository checkout, uncomment `build: .` in its `docker-compose.yml`, and run `docker compose up -d --build --wait`.
-
 ### Binary
 
 Download a binary from [GitHub Releases](https://github.com/Thinker-Joe/cline-pin-proxy/releases), or build with Go 1.23 or later:
 
 ```bash
 go build -o cline-pin-proxy ./cmd/cline-pin-proxy
-cp config.example.json config.json
 ./cline-pin-proxy serve -config config.json
 ```
 
 `-config` is explicit: the binary does not automatically load `config.json` from the working directory. Without it, configuration comes from defaults and environment variables.
-
-### Client configuration
-
-| Setting | Value |
-|---|---|
-| Base URL | `http://127.0.0.1:8787/v1` |
-| API key | A Cline API key with access to the requested model |
-| Example model | `cline-pass/deepseek-v4.1-flash` |
-
-By default, the proxy forwards the client's `Authorization` header. Set `api_key` or `CLINE_PIN_API_KEY` to use a fixed upstream key instead. A fixed key replaces client credentials; it does **not** enable authentication on the proxy's public API routes.
-
-For a test request, set `CLINE_KEY` to your Cline API key in your shell and run:
-
-```bash
-curl -i http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer $CLINE_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"cline-pass/deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":512}'
-```
-
-## Provider routing
-
-Rules match the request's `model` value without requiring a particular namespace. The default `deepseek` rule matches both `cline-pass/deepseek-v4.1-flash` and `deepseek/deepseek-v4-flash`; the `glm-5.3-flash` rule also matches `z-ai/glm-5.3-flash`. The proxy preserves the model ID. These prefixes are part of the JSON value, not the HTTP path: all use `POST /v1/chat/completions`.
-
-Historical tests confirmed provider switching for `deepseek/deepseek-v4-flash`: selecting `deepseek` or `novita` returned `provider: "DeepSeek"` or `"Novita"`. `z-ai/glm-5.3-flash` also passed direct-pipeline probing and an integration request with `z-ai` injected. Some `cline-pass/` models ignored provider filters. See the [verification record](docs/VERIFICATION.md#1-模型管道与上游标识).
-
-Other model IDs can use custom rules. Effective provider selection requires account access to the model and gateway support for its routing fields; a model's presence in `/v1/models` alone does not establish that support.
-
-Cline uses two routing pipelines. Each accepts provider preferences in a different part of the request:
-
-| Pipeline | Backend | Routing fields | Response metadata |
-|---|---|---|---|
-| `planner` | Vercel AI Gateway | `providerOptions.gateway` | `choices[0].message.provider_metadata.gateway.routing` |
-| `direct` | OpenRouter | Top-level `provider` | `provider` |
-
-Cline determines the pipeline for each model. With `pipeline: "auto"`, the proxy writes both sets of fields. For example, a strict DeepSeek rule adds:
-
-```json
-{
-  "providerOptions": {"gateway": {"only": ["deepseek"]}},
-  "provider": {"only": ["deepseek"]}
-}
-```
-
-Some models ignore these fields. Successful injection does not guarantee that Cline used the requested provider. Check the upstream routing metadata when validating a rule; wrapped responses place that metadata under `data`.
-
-### Default rules
-
-Rules use case-insensitive substring matching. The first match wins.
-
-| Model substring, in order | Provider | Mode |
-|---|---|---|
-| `deepseek` | `deepseek` | `strict` |
-| `glm-5.3-flash` | `relace` | `strict` |
-| `glm-5.3` | `friendli` | `strict` |
-
-Keep the flash rule before `glm-5.3`, which also matches flash model names. The two GLM models use different provider lists; a single broad `glm` rule can select an unsupported provider.
-
-The GLM defaults were chosen from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency guarantees or quality comparisons. Third-party providers may use quantized models; the tests did not establish numerical precision or output quality.
-
-Provider IDs, known filtering exceptions, and full measurements are recorded in [Verification notes (Chinese)](docs/VERIFICATION.md).
-
-### Rule fields
-
-| Field | Values and behavior |
-|---|---|
-| `name` | Label used in logs and response headers. Defaults to `rule-<index>`. |
-| `model` | Required model ID or substring to match. |
-| `match` | `contains` (default), `prefix`, or `exact`. All are case-insensitive. |
-| `pipeline` | `auto` (default) writes both pipelines; `planner` or `direct` writes only that pipeline. |
-| `mode` | `strict` (default) writes `only` with the first provider. `preferred` writes `order` and allows fallback. |
-| `upstreams` | Required provider ID array. `strict` uses only the first item; `preferred` requires at least two. |
-| `sort` | Optional: `cost`, `ttft`, or `tps`. On the direct pipeline these map to `price`, `latency`, and `throughput`. |
-
-On the selected pipelines, `strict` removes an existing `order`; `preferred` removes existing `only` and `allow_fallbacks` fields. Other provider options are preserved. `sort` replaces the caller's value only when configured. Adding `sort` to a strict rule does not enable fallback or remove `only`; rules cannot express sorting alone.
-
-A file's `rules` field replaces the entire default rule list. Use `"rules": []` to disable injection. See [config.example.json](config.example.json) for a complete configuration matching the defaults.
-
-## Response compatibility
-
-Cline has been observed returning non-streaming completions in this format:
-
-```json
-{"data":{"choices":[{"message":{"role":"assistant","content":"OK"}}]},"success":true}
-```
-
-Clients that expect top-level `choices` cannot read the completion. By default, the proxy returns the inner `data` object and sets `X-Cline-Pin-Unwrapped: data-envelope`.
-
-Unwrapping applies only to responses with a JSON content type and all of these properties:
-
-- The top level has no `choices` field.
-- `data` is an object.
-- `data.choices` is a non-empty array.
-
-Other response bodies remain unchanged. JSON responses are buffered up to an 8 MiB limit, with one extra byte read to detect overflow. Larger responses are forwarded unchanged and marked `X-Cline-Pin-Unwrapped: skipped-too-large`. SSE (`text/event-stream`) responses are forwarded and flushed as chunks arrive, without JSON parsing or waiting for the complete response.
-
-Set `"unwrap_data_envelope": false` to disable this conversion. The setting applies to JSON responses on all forwarded routes, independent of whether a provider rule matched.
 
 ## Configuration
 
@@ -243,23 +133,19 @@ Precedence is **non-empty environment variables > configuration file > defaults*
 | `unwrap_data_envelope` | `true` | `CLINE_PIN_UNWRAP_DATA_ENVELOPE` |
 | `rules` | [Default rules](#default-rules) | `CLINE_PIN_RULES` |
 
-`CLINE_PIN_FORWARD_HEADERS` accepts comma-separated header names. `CLINE_PIN_PROBE_HEADERS` accepts comma-separated `name: value` pairs. `CLINE_PIN_RULES` accepts a JSON array. `CLINE_PIN_LOG_LEVEL` sets `debug`, `info`, `warn`, or `error` and has no JSON equivalent.
+`CLINE_PIN_FORWARD_HEADERS` takes comma-separated header names, `CLINE_PIN_PROBE_HEADERS` comma-separated `name: value` pairs, and `CLINE_PIN_RULES` a JSON array. `CLINE_PIN_LOG_LEVEL` sets `debug`, `info`, `warn`, or `error` and has no JSON equivalent.
 
-`upstream` must be an HTTP(S) URL with a host and no query or fragment. Configuration must be a JSON object; `null` is not valid. Invalid rule JSON and invalid numeric or boolean environment values are rejected by the normal configuration loader. The missing-file startup exception is recorded under [known implementation limits](docs/CODE_REVIEW.md#current-implementation-limits).
+`upstream` must be an HTTP(S) URL with a host and no query or fragment. The configuration must be a JSON object; `null` is not valid. Invalid rule JSON and invalid numeric or boolean environment values fail loading. The missing-file startup exception is recorded under [known implementation limits](docs/CODE_REVIEW.md#current-implementation-limits).
 
 ### Reloading
 
-The server checks the file's modification time at the configured interval. A valid update replaces the active configuration. An invalid or missing file leaves the last valid configuration active; repeated identical errors are logged once, followed by a recovery message when loading succeeds.
+The server polls the file's modification time at the configured interval. A valid update replaces the active configuration; an invalid or missing file keeps the last valid one, with repeated identical errors logged once and a recovery message once loading succeeds.
 
-`listen`, `watch_seconds`, and the log level take effect at startup. Other configuration fields can reload, including the admin token. The Docker image sets `CLINE_PIN_LISTEN=0.0.0.0:8787` so that port publishing works; this overrides the example file's loopback address inside the container.
-
-Environment overrides still apply after reload. To manage a field through the file, remove its non-empty environment override. A container's environment changes only when it is recreated. Restarting a process rereads its file, but `docker compose up -d` alone does not restart a container merely because a mounted file changed.
-
-When `serve -config` names a missing file, the server starts with defaults and environment settings and watches for the file to appear. An existing invalid file prevents startup. The `check` and `probe` commands require an explicitly named file to exist.
+Editing a mounted file needs no container restart: the watcher reloads it in place. `listen`, `watch_seconds`, and the log level apply at startup only; everything else can reload, including the admin token. Environment overrides still win after a reload, so remove a field's override before managing it through the file, and recreate a container to change its environment. `serve -config` with a missing file starts on defaults and environment settings and waits for the file to appear; an existing invalid file prevents startup. `check` and `probe` require the file they name to exist.
 
 ### Admin API
 
-Set `admin_token` to enable these endpoints. Authenticate with `Authorization: Bearer <token>` or `X-Admin-Token: <token>`.
+Set `admin_token` to enable these endpoints, and authenticate with `Authorization: Bearer <token>` or `X-Admin-Token: <token>`.
 
 | Method | Path | Behavior |
 |---|---|---|
@@ -269,45 +155,97 @@ Set `admin_token` to enable these endpoints. Authenticate with `Authorization: B
 | `POST` | `/admin/probe` | Probe with `{"model":"...","pipeline":"auto"}`. |
 | `POST` | `/admin/reload` | Reload the file immediately. |
 
-Without a token, these routes return 404 unless `admin_allow_unauthenticated` is explicitly enabled. When a token is set, missing or incorrect credentials return 401 even if that flag is enabled. Allow unauthenticated access only in a trusted environment.
-
-For shell examples below, set `ADMIN_TOKEN` to the configured admin token:
+Without a token these routes return 404 unless `admin_allow_unauthenticated` is explicitly enabled; with a token set, missing or incorrect credentials return 401 even then. Allow unauthenticated access only in a trusted environment.
 
 ```bash
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://127.0.0.1:8787/admin/rules
-
-# Save, edit, and submit the complete rule list.
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://127.0.0.1:8787/admin/rules > rules.json
-# Edit rules.json before running the next command.
+# Edit rules.json, then submit the complete list.
 curl -fsS -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' --data-binary @rules.json \
   http://127.0.0.1:8787/admin/rules
 ```
 
-`PUT` accepts a bare array or `{"rules":[...]}`. It rejects `null`, null elements, unknown rule fields, and trailing data. Only `[]` explicitly clears the list.
+`PUT` accepts a bare array or `{"rules":[...]}` and rejects `null`, null elements, unknown rule fields, and trailing data; only `[]` clears the list. A successful response reports `applied`, `persisted`, and the current `rules`; if saving fails it also returns `persist_error` and `hint`, and unsaved rules can be replaced by a later reload or lost on restart. `CLINE_PIN_RULES` keeps overriding file rules, so remove that override before managing rules through the API and inspect the returned array.
 
-A successful response includes `applied`, `persisted`, and the current `rules` array. If saving fails, it also includes `persist_error` and `hint`. Unsaved rules can be replaced by a later reload or lost on restart. `CLINE_PIN_RULES` continues to override file rules after loading; remove that override before managing rules through the API and inspect the returned array.
+Saving rewrites only the `rules` value, preserves other JSON values and existing file permission bits, and does not copy environment secrets into the file. Atomic replacement needs a writable directory; the container runs as UID/GID 65532, so on Linux use `sudo chown -R 65532:65532 data`. If atomic replacement is unavailable the proxy may write in place and logs a warning; in-place writes are not atomic, and disk-full or I/O errors do not trigger that fallback. `POST /admin/probe` uses the configured upstream key and probe headers; the admin token is not an upstream credential.
 
-Saving changes only the `rules` value, preserves other JSON values and existing file permission bits, and does not copy environment secrets into the file. Atomic replacement requires a writable directory. The service runs as UID/GID 65532 in Docker; on Linux, `sudo chown -R 65532:65532 data` grants it ownership of the mounted directory. If atomic replacement is unavailable, the proxy may write in place and logs a warning. In-place writes are not atomic. Disk-full and I/O errors do not trigger that fallback.
+## Provider routing
 
-`POST /admin/probe` uses the configured upstream key and probe headers. The admin token is not an upstream credential.
+Rules match the request's `model` value; no namespace is required, and the proxy preserves the model ID. The default `deepseek` rule matches both `cline-pass/deepseek-v4.1-flash` and `deepseek/deepseek-v4-flash`, and the `glm-5.3-flash` rule also matches `z-ai/glm-5.3-flash`. These prefixes are part of the JSON value, not the HTTP path: all of them use `POST /v1/chat/completions`.
+
+Cline uses two routing pipelines, each reading provider preferences from a different place:
+
+| Pipeline | Backend | Routing fields | Response metadata |
+|---|---|---|---|
+| `planner` | Vercel AI Gateway | `providerOptions.gateway` | `choices[0].message.provider_metadata.gateway.routing` |
+| `direct` | OpenRouter | Top-level `provider` | `provider` |
+
+Cline decides the pipeline for each model. With `pipeline: "auto"` the proxy writes both sets of fields; a strict DeepSeek rule adds:
+
+```json
+{
+  "providerOptions": {"gateway": {"only": ["deepseek"]}},
+  "provider": {"only": ["deepseek"]}
+}
+```
+
+Effective selection also needs account access to the model and gateway support for its routing fields; appearing in `/v1/models` does not establish that. Some models ignore these fields entirely, so successful injection does not guarantee Cline used the requested provider — check the upstream routing metadata, which wrapped responses place under `data`. Tests confirmed switching for `deepseek/deepseek-v4-flash` (`deepseek` → `provider: "DeepSeek"`, `novita` → `"Novita"`) and a `z-ai/glm-5.3-flash` integration request, while some `cline-pass/` models ignored the filters. See the [verification record](docs/VERIFICATION.md#1-模型管道与上游标识).
+
+### Default rules
+
+Rules use case-insensitive substring matching, and the first match wins.
+
+| Model substring, in order | Provider | Mode |
+|---|---|---|
+| `deepseek` | `deepseek` | `strict` |
+| `glm-5.3-flash` | `relace` | `strict` |
+| `glm-5.3` | `friendli` | `strict` |
+
+`glm-5.3` also matches the flash model name, so the flash rule must stay first; the two GLM models have different provider lists, so a single broad `glm` rule can select an unsupported provider. The GLM defaults come from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency or quality guarantees; third-party providers may serve quantized models. Provider IDs, known filtering exceptions, and full measurements are in the [verification notes (Chinese)](docs/VERIFICATION.md).
+
+### Rule fields
+
+| Field | Values and behavior |
+|---|---|
+| `name` | Label used in logs and response headers. Defaults to `rule-<index>`. |
+| `model` | Required model ID or substring to match. |
+| `match` | `contains` (default), `prefix`, or `exact`. All are case-insensitive. |
+| `pipeline` | `auto` (default) writes both pipelines; `planner` or `direct` writes only that pipeline. |
+| `mode` | `strict` (default) writes `only` with the first provider. `preferred` writes `order` and allows fallback. |
+| `upstreams` | Required provider ID array. `strict` uses only the first item; `preferred` requires at least two. |
+| `sort` | Optional: `cost`, `ttft`, or `tps`. On the direct pipeline these map to `price`, `latency`, and `throughput`. |
+
+On the selected pipelines, `strict` removes an existing `order`, and `preferred` removes existing `only` and `allow_fallbacks`; other provider options are preserved, and `sort` replaces the caller's value only when configured. Adding `sort` to a strict rule neither enables fallback nor removes `only`, so rules cannot express sorting alone. A file's `rules` field replaces the entire default list; use `"rules": []` to disable injection. [config.example.json](config.example.json) is a complete configuration matching the defaults.
+
+## Response compatibility
+
+Cline has been observed returning non-streaming completions wrapped like this, which clients that read top-level `choices` cannot parse:
+
+```json
+{"data":{"choices":[{"message":{"role":"assistant","content":"OK"}}]},"success":true}
+```
+
+By default the proxy returns the inner `data` object and sets `X-Cline-Pin-Unwrapped: data-envelope`. Unwrapping requires a JSON content type plus all of the following:
+
+- The top level has no `choices` field.
+- `data` is an object.
+- `data.choices` is a non-empty array.
+
+Other bodies are forwarded unchanged. JSON responses are buffered up to an 8 MiB limit, with one extra byte read to detect overflow; larger responses are forwarded unchanged and marked `X-Cline-Pin-Unwrapped: skipped-too-large`. SSE (`text/event-stream`) is forwarded and flushed as chunks arrive, without JSON parsing or waiting for the complete response. Set `"unwrap_data_envelope": false` to disable the conversion; it applies to JSON responses on all forwarded routes, whether or not a rule matched.
 
 ## Probe and validate
 
-With `CLINE_PIN_API_KEY` set, inspect providers reported by the gateway:
+With `CLINE_PIN_API_KEY` set, list the providers the gateway reports:
 
 ```bash
 ./cline-pin-proxy probe -model cline-pass/deepseek-v4.1-flash
 ./cline-pin-proxy probe -model deepseek/deepseek-v4-flash -H 'x-client-type: cline-cli'
 ```
 
-The probe injects `only: ["__probe__"]` and parses the routing error. Models that honor the filter reject the request before inference. Models that ignore it may generate a response and incur charges. The returned provider list can be incomplete, and a listed provider can still fail a real request.
+The probe injects `only: ["__probe__"]` and parses the routing error. Models that honor the filter reject the request before inference; models that ignore it may generate a response and incur charges. The returned list can be incomplete, and a listed provider can still fail a real request. Use `-pipeline planner` or `-pipeline direct` to restrict injection; probes send `x-client-type: cline-cli` by default because some models return 403 without it. The printed suggested rule is an exact match on the first reported provider — review that choice, since replacing `rules` replaces all existing rules.
 
-Use `-pipeline planner` or `-pipeline direct` to restrict injection. Probe requests include `x-client-type: cline-cli` by default; some models return 403 without it. A probe prints a suggested exact-match rule, selecting the first reported provider. Review that choice before using it; replacing `rules` also replaces all existing rules.
-
-Validate configuration and preview a match without contacting Cline:
+`check` validates configuration and previews a match without contacting Cline:
 
 ```bash
 ./cline-pin-proxy check -config config.json -model cline-pass/glm-5.3-flash
@@ -334,29 +272,29 @@ For a Cline Pass account configured as an OpenAI-compatible API-key account in s
 | `X-Cline-Pin-Note` | Why injection was skipped: no match, unreadable model, or injection failure. |
 | `X-Cline-Pin-Unwrapped` | `data-envelope` when converted; `skipped-too-large` when over the buffer limit. |
 
-Pinning headers report proxy decisions, not the provider Cline actually used. They are not added to ordinary passthrough routes. Upstream `x-*` headers are forwarded when present; the proxy does not generate an actual-provider header.
+These headers report the proxy's decisions, not the provider Cline actually used, and are not added to ordinary passthrough routes. Upstream `x-*` headers are forwarded when present; the proxy does not generate an actual-provider header.
 
-Logs use Go's `slog` text format on stderr. A pinned request includes `model`, `rule`, `upstreams`, `mode`, and `pipeline`:
+Logs use Go's `slog` text format on stderr. A pinned request logs `model`, `rule`, `upstreams`, `mode`, and `pipeline`:
 
 ```text
 level=INFO msg="pinned request" model=cline-pass/deepseek-v4.1-flash rule=deepseek upstreams=deepseek mode=strict pipeline=auto
 ```
 
-If a non-streaming completion appears empty, check `X-Cline-Pin-Unwrapped` and the response's `choices` location. Also allow enough output tokens: a recorded test with `max_tokens: 24` produced `empty response content` errors on five of six reasoning models; all six succeeded with 512. This is separate from response wrapping.
+If a non-streaming completion appears empty, check `X-Cline-Pin-Unwrapped` and where `choices` sits, and allow enough output tokens: a recorded test with `max_tokens: 24` produced `empty response content` errors on five of six reasoning models, and all six succeeded with 512. That is separate from response wrapping.
 
 ## Behavior and security
 
-- Provider fields are injected only for `POST /v1/chat/completions`, `/chat/completions`, and `/api/v1/chat/completions`. Other requests under `/v1/` and `/api/v1/` are forwarded without request-body rewriting. `OPTIONS` is handled locally.
+- Provider fields are injected only for `POST /v1/chat/completions`, `/chat/completions`, and `/api/v1/chat/completions`. Other requests under `/v1/` and `/api/v1/` are forwarded without request-body rewriting, and `OPTIONS` is handled locally.
 - Unmatched or unparseable chat requests retain their original body. Injection failures also fall back to the original body and are marked in the response headers.
-- Upstream status codes are preserved. Redirects are returned with `Location` and are not followed. Response bodies are preserved except for the JSON envelope conversion described above; HTTP framing and compression may be handled by Go's transport.
+- Upstream status codes are preserved. Redirects are returned with `Location` and are not followed. Response bodies are preserved except for the JSON envelope conversion; HTTP framing and compression may be handled by Go's transport.
 - SSE is copied with a fixed-size buffer and flushed after each read. The proxy has no overall HTTP client timeout; dial and TLS timeouts are 10 seconds each, and the response-header timeout is 120 seconds.
-- The normal streaming path aborts the downstream connection if the upstream body ends with a read error. Buffered JSON reads do the same. The oversized JSON fallback has a separate [known limitation](docs/CODE_REVIEW.md#current-implementation-limits).
+- The normal streaming path aborts the downstream connection if the upstream body ends with a read error, and buffered JSON reads do the same. The oversized JSON fallback has a separate [known limitation](docs/CODE_REVIEW.md#current-implementation-limits).
 - Each forwarded request uses one configuration snapshot. Injection preserves JSON number precision and does not HTML-escape `<`, `>`, or `&`.
-- Request bodies are limited to 64 MiB by default, including on passthrough routes. Over-limit reads return 413; unknown-length bodies may already have been partially sent upstream.
-- API paths are validated before forwarding. Encoded paths and traversal segments are rejected by the proxy path validator. Requests outside supported routes return 404.
-- Request headers are limited to `Content-Type`, `Accept`, `Authorization`, `User-Agent`, and `forward_headers`. Response headers are limited to `Content-Type`, `Content-Encoding`, `Cache-Control`, `Retry-After`, `Location`, and `x-*`; upstream `Content-Length` is not copied. Buffered JSON responses get a computed length.
-- The default listener and Compose host port use loopback. Public API routes have no separate client authentication. Protect access with network controls or an authenticated reverse proxy if exposing them beyond trusted clients.
-- Keys stored in configuration files are plaintext. `config.json` and `data/` are git-ignored. `/admin/config` omits the two key fields but returns `probe_headers`; do not treat it as a general secret-redaction endpoint.
+- Request bodies are limited to 64 MiB by default, including on passthrough routes. Over-limit reads return 413; a body of unknown length may already have been partly sent upstream.
+- API paths are validated before forwarding: encoded paths and traversal segments are rejected, and requests outside supported routes return 404.
+- Request headers are forwarded only for `Content-Type`, `Accept`, `Authorization`, `User-Agent`, and `forward_headers`. Response headers are limited to `Content-Type`, `Content-Encoding`, `Cache-Control`, `Retry-After`, `Location`, and `x-*`; upstream `Content-Length` is not copied, and buffered JSON responses get a computed length.
+- The default listener and the Compose host port use loopback. Public API routes have no separate client authentication; protect access with network controls or an authenticated reverse proxy if exposing them beyond trusted clients.
+- Keys stored in configuration files are plaintext, and `config.json` and `data/` are git-ignored. `/admin/config` omits the two key fields but returns `probe_headers`; do not treat it as a general secret-redaction endpoint.
 
 ## Development and project notes
 
