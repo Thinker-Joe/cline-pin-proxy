@@ -55,6 +55,19 @@ jobs:
             exit 1
           fi
 
+      # CHANGELOG.md 是 Release 正文的唯一来源，缺条目就不要发布任何产物。
+      - name: Changelog entry for this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qF "## [$version]" CHANGELOG.md; then
+            echo "CHANGELOG.md 缺少 [${version}] 小节，无法发布 ${GITHUB_REF_NAME}"
+            echo "请先把 [Unreleased] 的内容整理进 '## [${version}] - YYYY-MM-DD' 并推到 main"
+            exit 1
+          fi
+          echo "CHANGELOG.md 已包含 [${version}] 小节"
+
   # Publish multi-architecture images after verification.
   docker:
     name: Build & push image
@@ -135,6 +148,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 需要完整 tag 列表来生成与上一个版本的 compare 链接。
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -160,9 +176,34 @@ jobs:
           done
           ls -lh dist
 
+      # 取 CHANGELOG.md 中本 tag 对应的小节作为 Release 正文。
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          awk -v want="## [$version]" '
+            index($0, want) == 1 { inside = 1; next }
+            inside && (substr($0, 1, 4) == "## [" || substr($0, 1, 1) == "[") { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME" >> release-notes.md
+          fi
+
+          sed -i '/./,$!d' release-notes.md   # 去掉小节标题后的空行
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md 的 [${version}] 小节为空"
+            exit 1
+          fi
+          echo "----- release notes -----"
+          cat release-notes.md
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true

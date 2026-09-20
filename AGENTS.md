@@ -56,6 +56,7 @@ bash scripts/linux-check.sh
 | `internal/admin/` | 管理 API 与认证 |
 | `internal/probe/` | 注入 `__probe__` 并解析网关错误中的候选列表 |
 | `CONTRIBUTING.md` | 开发检查与发布流程 |
+| `CHANGELOG.md` | 各版本的用户可见变更，Release 正文的唯一来源 |
 | `docs/VERIFICATION.md` | 上游标识、管道与延迟的实测依据 |
 | `docs/CODE_REVIEW.md` | 历史审查、修复和当前实现限制 |
 
@@ -86,4 +87,5 @@ bash scripts/linux-check.sh
 - 验收要求：`go test ./...`、`go vet ./...` 通过，`gofmt -l .` 无输出；并发与跨平台改动按上文补充验证。
 - 新增上游标识和管道结论必须有 `docs/VERIFICATION.md` 中的实测依据，不使用网关文档或推测替代。历史数据应保留日期与适用范围。
 - 不提交密钥，保留 `config.json`、`data/` 的 git 忽略规则。
+- 发布 tag 前先在 `CHANGELOG.md` 把 `[Unreleased]` 的内容整理进新的 `## [x.y.z] - YYYY-MM-DD` 小节。Release workflow 以该小节作为 GitHub Release 正文，缺失时 `verify` 阶段失败，不推送镜像、不创建 Release。
 - 未经用户明确要求，不执行 commit、push 或创建 tag。

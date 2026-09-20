@@ -66,6 +66,18 @@ The `boundary_test.go` files contain regressions from the code review. `envelope
 
 Use file paths and symbols in review notes rather than line numbers that become stale after edits. Keep historical test results clearly dated; do not present them as current service guarantees.
 
+## Changelog and releases
+
+`CHANGELOG.md` is the single source of release notes: the Release workflow extracts the section matching the pushed tag and uses it as the GitHub Release body, and `verify` fails — before any image is pushed — when that section is missing.
+
+To cut a release:
+
+1. Move the finished entries out of `[Unreleased]` into a new `## [x.y.z] - YYYY-MM-DD` section, keeping the category headings. Describe what changed for users rather than restating commits. Dates use the maintainer's local date (UTC+8).
+2. Push that change to `main` and wait for CI.
+3. Create the tag. The `v` prefix is required: the workflow matches `v*` and derives the `1.0`, `1.0.0`, `v1.0.0`, and `sha-<short>` image tags from it. The binary version comes from the tag name, so no source edit is needed.
+
+When a previous version tag exists, the workflow appends a `Full Changelog` compare link to the release body.
+
 ## CI and releases
 
 CI runs on pushes to `main`, pull requests, and manual dispatch. It checks module tidiness, formatting, vet, race tests with coverage, and compilation.

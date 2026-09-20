@@ -298,7 +298,7 @@ level=INFO msg="pinned request" model=cline-pass/deepseek-v4.1-flash rule=deepse
 
 ## 开发与项目资料
 
-源码结构、检查命令和发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。历史网关测试见[实测记录](docs/VERIFICATION.md)，审查基线、修复结果和当前限制见[代码审查记录](docs/CODE_REVIEW.md)。这两份详细记录使用中文。
+源码结构、检查命令和发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。各版本的用户可见变更见 [CHANGELOG.md](CHANGELOG.md)，发布时由 workflow 取对应小节作为 GitHub Release 正文。历史网关测试见[实测记录](docs/VERIFICATION.md)，审查基线、修复结果和当前限制见[代码审查记录](docs/CODE_REVIEW.md)。这两份详细记录使用中文。
 
 路由知识来自 [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher)、[cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway) 和 [dsh-cline-pass](https://github.com/yhshzh/dsh-cline-pass) 的公开记录，本项目未复制其源代码。详见 [NOTICE](NOTICE)。
 

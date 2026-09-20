@@ -298,7 +298,7 @@ If a non-streaming completion appears empty, check `X-Cline-Pin-Unwrapped` and w
 
 ## Development and project notes
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the source layout, checks, and release workflow. Historical gateway tests are in [docs/VERIFICATION.md](docs/VERIFICATION.md); the review baseline, fixes, and current limitations are in [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md). These detailed records are in Chinese.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the source layout, checks, and release workflow. User-visible changes per version are recorded in [CHANGELOG.md](CHANGELOG.md), and the section for a tag becomes that release's GitHub notes. Historical gateway tests are in [docs/VERIFICATION.md](docs/VERIFICATION.md); the review baseline, fixes, and current limitations are in [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md). These detailed records are in Chinese.
 
 Routing knowledge came from public records in [cline-pass-switcher](https://github.com/munmunjaklin458-afk/cline-pass-switcher), [cpagw-gateway](https://github.com/Stabilize7440/cpagw-gateway), and [dsh-cline-pass](https://github.com/yhshzh/dsh-cline-pass). No source code was copied from those projects. See [NOTICE](NOTICE).
 
