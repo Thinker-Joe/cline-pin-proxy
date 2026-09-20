@@ -21,7 +21,7 @@
 
 面向 Cline API 的上游路由与响应格式兼容代理。源码采用多包布局，构建为单个 Go 可执行文件；模块要求 Go 1.23，CI 和容器构建使用 Go 1.25。仅使用标准库，`go.mod` 不含第三方依赖。
 
-规则匹配 JSON 中的模型 ID，不限制 `cline-pass/` 前缀，也不改写模型 ID。非该前缀的 `deepseek/deepseek-v4-flash` 已有切换上游的实测记录；不能仅凭模型前缀判断是否支持上游选择。
+规则匹配 JSON 中的模型 ID，不限制 `cline-pass/` 前缀，也不改写模型 ID。非该前缀的 `deepseek/deepseek-v4-flash` 已有切换上游的实测记录；不能仅凭模型前缀判断是否支持上游选择。`cline-pass/` 是路由前缀而非模型名的一部分，后面必须是目录中真实存在的 slug，且同一 slug 带前缀与不带前缀的默认上游可能不同。上游过滤字段是否被采纳由 Cline 决定，逐模型不同（同一条管道上的不同模型也会不同）且可能随时变化；引用或修改涉及过滤的结论前，必须按 `docs/VERIFICATION.md` 第 11 节的方法复测。
 
 Cline 按模型选择 planner（Vercel AI Gateway）或 direct（OpenRouter）管道。默认同时写入 `providerOptions.gateway` 和顶层 `provider`。部分模型忽略过滤条件，注入成功不代表上游实际采用了指定服务商。
 
@@ -85,7 +85,7 @@ bash scripts/linux-check.sh
 
 - 零第三方依赖是硬约束。新增依赖前说明理由并取得确认。
 - 验收要求：`go test ./...`、`go vet ./...` 通过，`gofmt -l .` 无输出；并发与跨平台改动按上文补充验证。
-- 新增上游标识和管道结论必须有 `docs/VERIFICATION.md` 中的实测依据，不使用网关文档或推测替代。历史数据应保留日期与适用范围。
+- 新增上游标识和管道结论必须有 `docs/VERIFICATION.md` 中的实测依据，不使用网关文档或推测替代。历史数据应保留日期与适用范围；过滤类结论失效时新增带日期的记录并标注旧结论的适用边界，不直接改写历史结论。判断过滤是否生效必须做多点反证（指定不同候选应得到不同上游，并补一个应当失败的否定用例），"指定 A 得到 A"不能作为依据。
 - 不提交密钥，保留 `config.json`、`data/` 的 git 忽略规则。
 - 发布 tag 前先在 `CHANGELOG.md` 把 `[Unreleased]` 的内容整理进新的 `## [x.y.z] - YYYY-MM-DD` 小节。Release workflow 以该小节作为 GitHub Release 正文，缺失时 `verify` 阶段失败，不推送镜像、不创建 Release。
 - 未经用户明确要求，不执行 commit、push 或创建 tag。

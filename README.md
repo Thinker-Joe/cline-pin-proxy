@@ -174,6 +174,8 @@ Saving rewrites only the `rules` value, preserves other JSON values and existing
 
 Rules match the request's `model` value; no namespace is required, and the proxy preserves the model ID. The default `deepseek` rule matches both `cline-pass/deepseek-v4.1-flash` and `deepseek/deepseek-v4-flash`, and the `glm-5.3-flash` rule also matches `z-ai/glm-5.3-flash`. These prefixes are part of the JSON value, not the HTTP path: all of them use `POST /v1/chat/completions`.
 
+`cline-pass/` is a routing prefix, not part of a model name: what follows it must be a model slug that exists in the catalogue, and the same slug can route differently with and without the prefix. As of 2026-09-20, `cline-pass/deepseek-v4.1-flash` defaulted to the DeepSeek provider while the bare `deepseek/deepseek-v4.1-flash` defaulted to Alibaba — so changing an ID between those forms changes routing even when pinning has no effect.
+
 Cline uses two routing pipelines, each reading provider preferences from a different place:
 
 | Pipeline | Backend | Routing fields | Response metadata |
@@ -190,7 +192,9 @@ Cline decides the pipeline for each model. With `pipeline: "auto"` the proxy wri
 }
 ```
 
-Effective selection also needs account access to the model and gateway support for its routing fields; appearing in `/v1/models` does not establish that. Some models ignore these fields entirely, so successful injection does not guarantee Cline used the requested provider — check the upstream routing metadata, which wrapped responses place under `data`. Tests confirmed switching for `deepseek/deepseek-v4-flash` (`deepseek` → `provider: "DeepSeek"`, `novita` → `"Novita"`) and a `z-ai/glm-5.3-flash` integration request, while some `cline-pass/` models ignored the filters. See the [verification record](docs/VERIFICATION.md#1-模型管道与上游标识).
+Effective selection also needs account access to the model and gateway support for its routing fields; appearing in `/v1/models` does not establish that. Whether a model honors these fields is decided by Cline, varies per model — including between models on the same pipeline — and can change without notice. Successful injection therefore does not guarantee the requested provider was used. Confirm with the response metadata: `choices[0].message.provider_metadata.gateway.routing.finalProvider` on the planner pipeline, or top-level `provider` on the direct pipeline. When a filter is honored, `planningReasoning` contains `Provider set restricted to: <slug>` and `fallbacksAvailable` narrows.
+
+As of 2026-09-20 the whole `providerOptions.gateway` block (`only`, `order`, `sort`) had no effect on `deepseek/deepseek-v4.1-flash`, while `z-ai/glm-5.3` (planner), `z-ai/glm-5.3-flash`, and `deepseek/deepseek-v4-flash` (direct) still honored it. The same model did honor it earlier the same day, so treat these as dated observations and re-check before relying on a rule. Models already known to ignore the filters on 2026-09-16: `cline-pass/deepseek-v4-flash` and `cline-pass/deepseek-v4-pro`; the private channels behind `cline-pass/deepseek-v4-flash` and `cline-pass/kimi-k3` ignored them on 2026-09-20. See the [verification record](docs/VERIFICATION.md).
 
 ### Default rules
 
@@ -202,7 +206,9 @@ Rules use case-insensitive substring matching, and the first match wins.
 | `glm-5.3-flash` | `relace` | `strict` |
 | `glm-5.3` | `friendli` | `strict` |
 
-`glm-5.3` also matches the flash model name, so the flash rule must stay first; the two GLM models have different provider lists, so a single broad `glm` rule can select an unsupported provider. The GLM defaults come from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency or quality guarantees; third-party providers may serve quantized models. Provider IDs, known filtering exceptions, and full measurements are in the [verification notes (Chinese)](docs/VERIFICATION.md).
+`glm-5.3` also matches the flash model name, so the flash rule must stay first; the two GLM models have different provider lists, so a single broad `glm` rule can select an unsupported provider. The GLM defaults come from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency or quality guarantees; third-party providers may serve quantized models.
+
+The first rule needs a caveat: as of 2026-09-20 it cannot enforce anything on `deepseek/deepseek-v4.1-flash`, so DeepSeek is used there because Cline's own default already selects it — not because the proxy pinned it. If you need an enforced provider for that model, use `deepseek/deepseek-v4-flash`, whose requests are still filtered; measured first-byte time was about 0.9 s versus 0.55 s for the unfiltered `cline-pass/deepseek-v4.1-flash` route. Provider IDs, filtering exceptions, and full measurements are in the [verification notes (Chinese)](docs/VERIFICATION.md).
 
 ### Rule fields
 
@@ -272,7 +278,7 @@ For a Cline Pass account configured as an OpenAI-compatible API-key account in s
 | `X-Cline-Pin-Note` | Why injection was skipped: no match, unreadable model, or injection failure. |
 | `X-Cline-Pin-Unwrapped` | `data-envelope` when converted; `skipped-too-large` when over the buffer limit. |
 
-These headers report the proxy's decisions, not the provider Cline actually used, and are not added to ordinary passthrough routes. Upstream `x-*` headers are forwarded when present; the proxy does not generate an actual-provider header.
+These headers report the proxy's decisions, not the provider Cline actually used, and are not added to ordinary passthrough routes. Upstream `x-*` headers are forwarded when present; the proxy does not generate an actual-provider header. To check whether a pin took effect, read the routing metadata from the response body as described under [Provider routing](#provider-routing).
 
 Logs use Go's `slog` text format on stderr. A pinned request logs `model`, `rule`, `upstreams`, `mode`, and `pipeline`:
 

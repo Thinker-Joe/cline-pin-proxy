@@ -174,6 +174,8 @@ curl -fsS -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 规则匹配请求中的 `model` 值，不要求特定命名空间，代理保留原模型 ID。默认 `deepseek` 规则同时匹配 `cline-pass/deepseek-v4.1-flash` 和 `deepseek/deepseek-v4-flash`；`glm-5.3-flash` 规则也匹配 `z-ai/glm-5.3-flash`。这些前缀属于 JSON 字段，不是 HTTP 路径，调用端点都是 `POST /v1/chat/completions`。
 
+`cline-pass/` 是**路由前缀，不是模型名的一部分**：后面必须是目录中真实存在的 slug，而且同一个 slug 带前缀与不带前缀可能路由到不同上游。2026-09-20 实测：`cline-pass/deepseek-v4.1-flash` 默认走 DeepSeek，非前缀的 `deepseek/deepseek-v4.1-flash` 默认走 Alibaba——所以在两种写法之间改 ID 会改变路由，即使钉死本身没生效。
+
 Cline 使用两条路由管道，分别从不同的请求字段读取上游设置：
 
 | 管道 | 后端 | 路由字段 | 响应中的路由信息 |
@@ -190,7 +192,9 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 }
 ```
 
-上游选择要生效，账号必须有权访问该模型，网关也必须支持它的路由字段；模型出现在 `/v1/models` 中不能单独证明这一点。部分模型会完全忽略这些字段，代理成功注入并不代表 Cline 实际采用了指定上游，验证规则时需要检查上游返回的路由信息（未还原包装的响应放在 `data` 下）。实测已确认 `deepseek/deepseek-v4-flash` 可切换上游（指定 `deepseek` 返回 `provider: "DeepSeek"`，指定 `novita` 返回 `"Novita"`），`z-ai/glm-5.3-flash` 也通过了注入 `z-ai` 的集成请求，而部分 `cline-pass/` 模型会忽略上游过滤。依据见[实测记录](docs/VERIFICATION.md#1-模型管道与上游标识)。
+上游选择要生效，账号必须有权访问该模型，网关也必须支持它的路由字段；模型出现在 `/v1/models` 中不能单独证明这一点。**这些字段是否被采纳由 Cline 决定，逐模型不同（同一条管道上的不同模型也会不同），并且可能随时变化。**因此代理注入成功并不代表 Cline 采用了指定上游，必须读响应元数据确认：planner 管道看 `choices[0].message.provider_metadata.gateway.routing.finalProvider`，direct 管道看顶层 `provider`。过滤被采纳时，`planningReasoning` 里会出现 `Provider set restricted to: <slug>`，且 `fallbacksAvailable` 收窄。
+
+2026-09-20 实测：`deepseek/deepseek-v4.1-flash` 的整个 `providerOptions.gateway`（`only`、`order`、`sort`）全部无效；而 `z-ai/glm-5.3`（planner）、`z-ai/glm-5.3-flash` 与 `deepseek/deepseek-v4-flash`（direct）仍然生效。同一模型当天早些时候仍然生效，因此这些只是**带日期的观测值**，依赖任何规则前请重新验证。2026-09-16 已确认忽略过滤的有 `cline-pass/deepseek-v4-flash` 与 `cline-pass/deepseek-v4-pro`；2026-09-20 确认 `cline-pass/deepseek-v4-flash` 与 `cline-pass/kimi-k3` 背后的私有渠道同样忽略。依据见[实测记录](docs/VERIFICATION.md)。
 
 ### 默认规则
 
@@ -202,7 +206,9 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 | `glm-5.3-flash` | `relace` | `strict` |
 | `glm-5.3` | `friendli` | `strict` |
 
-`glm-5.3` 也能匹配 flash 模型名，因此 flash 规则必须放在前面；两个 GLM 模型的可用上游列表不同，合并为宽泛的 `glm` 规则可能选中不支持的上游。GLM 默认值依据 2026-09-16 的测量结果选择：`glm-5.3` 使用 `friendli` 时首个流式字节在 0.31–0.35 秒到达，`glm-5.3-flash` 使用 `relace` 时为 0.72–0.97 秒，各成功四次。这些是历史观测值，不构成延迟或质量保证，第三方服务商可能使用量化模型。上游标识（slug）、忽略过滤条件的已知模型和完整测量数据见[实测记录](docs/VERIFICATION.md)。
+`glm-5.3` 也能匹配 flash 模型名，因此 flash 规则必须放在前面；两个 GLM 模型的可用上游列表不同，合并为宽泛的 `glm` 规则可能选中不支持的上游。GLM 默认值依据 2026-09-16 的测量结果选择：`glm-5.3` 使用 `friendli` 时首个流式字节在 0.31–0.35 秒到达，`glm-5.3-flash` 使用 `relace` 时为 0.72–0.97 秒，各成功四次。这些是历史观测值，不构成延迟或质量保证，第三方服务商可能使用量化模型。
+
+第一条规则需要单独提醒：截至 2026-09-20，它对 `deepseek/deepseek-v4.1-flash` **无法强制任何东西**——该模型走 DeepSeek 是因为 Cline 自己的默认调度就选它，而不是代理钉住的。若需要"必须被强制"的上游，请改用 `deepseek/deepseek-v4-flash`（过滤仍然生效）；实测首字节约 0.9 秒，而未过滤的 `cline-pass/deepseek-v4.1-flash` 路线约 0.55 秒。上游标识、忽略过滤条件的已知模型和完整测量数据见[实测记录](docs/VERIFICATION.md)。
 
 ### 规则字段
 
@@ -272,7 +278,7 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 | `X-Cline-Pin-Note` | 未注入的原因：无匹配、无法读取模型字段或注入失败。 |
 | `X-Cline-Pin-Unwrapped` | `data-envelope` 表示已转换，`skipped-too-large` 表示超出缓冲上限。 |
 
-这些响应头只记录代理决策，不代表 Cline 实际使用的上游，普通透传路由不会添加。上游返回的 `x-*` 头会被转发，但代理自身不生成“实际服务商”响应头。
+这些响应头只记录代理决策，不代表 Cline 实际使用的上游，普通透传路由不会添加。上游返回的 `x-*` 头会被转发，但代理自身不生成“实际服务商”响应头。要确认钉死是否被采纳，请按[上游路由](#上游路由)一节读取响应体里的路由元数据。
 
 日志通过 Go 的 `slog` 以文本格式写入 stderr。规则注入日志包含 `model`、`rule`、`upstreams`、`mode` 和 `pipeline`：
 

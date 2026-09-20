@@ -1,6 +1,6 @@
 # 实测记录
 
-本文整理 2026-09-16 对 `api.cline.bot`、发布镜像和 sub2api 集成的测试记录。数据反映当时的账号、网关和配置，不保证当前仍然适用。本次文档整理未重新请求网关。
+本文整理 2026-09-16 与 2026-09-20 对 `api.cline.bot`、发布镜像和 sub2api 集成的测试记录。数据反映当时的账号、网关和配置，**不保证当前仍然适用**。2026-09-16 的记录未在整理时重新请求网关；2026-09-20 的复查（上游过滤时效性、模型 ID 命名与管道归属）见第 11 节，其中包含对前文若干结论的时效性修正。
 
 当前默认配置见 [README](../README.zh-CN.md#默认规则)。下文早期测试使用 GLM 官方上游 `zai` / `z-ai`，后续测速才将默认值改为 `friendli` / `relace`。规则注入成功、请求成功和上游实际采用指定服务商是三种不同的证据，需分别确认。
 
@@ -24,6 +24,8 @@
 | `z-ai/glm-5.3-flash` | direct | 27 | `z-ai` |
 
 planner 读取 `providerOptions.gateway.only`，direct 读取顶层 `provider.only`。默认 `auto` 同时写入两组字段。
+
+> **2026-09-20 复查**：上表中 `cline-pass/deepseek-v4.1-flash` 的"支持过滤"结论已失效——该模型对 `providerOptions.gateway` 的 `only` / `order` / `sort` 均不再响应；能继续用过滤的 deepseek 模型是 `deepseek/deepseek-v4-flash`。另外带 `cline-pass/` 前缀与不带的同一 slug 默认上游不同。详见第 11 节。
 
 ### 同一服务商在不同管道中的标识
 
@@ -49,6 +51,8 @@ planner 读取 `providerOptions.gateway.only`，direct 读取顶层 `provider.on
 | `cline-pass/deepseek-v4-flash-vision-exp` | 404 `model not found` | 当时不可用 |
 
 在这组模型中，前两项确认支持上游选择。默认 `deepseek` 规则也会匹配忽略过滤的模型，但不能改变它们的路由。原始表曾把 vision-exp 归为私有渠道；404 结果不支持该归类，现改为未确认。
+
+> **2026-09-20 复查**：以 `only: ["__probe__"]` 判断"是否支持过滤"的方法本身没有变，但 `cline-pass/deepseek-v4.1-flash` 的结论已反转（当日 01:31 仍返回路由错误，12:30 前后改为返回正文/`empty response content`，即过滤被丢弃）。复查方法与局限见第 11 节。
 
 ### 探测列表的局限
 
@@ -446,3 +450,92 @@ sub2api 再次测试账号 268 的三个模型和账号 301 的两个模型，�
 - 未在线上用超过 8 MiB 的真实响应验证转换回退，现有完整性证据来自单测。
 - 探测依赖 `from Vercel`、`from Openrouter`、`available_providers`、`Available providers are` 等错误文本。格式变化时可能无法解析，命令会返回原始片段供排查。
 - 上游列表、延迟和模型可用性都可能变化。新结论应附测试日期、请求设置和实际路由信息，不以旧记录替代复测。
+
+## 11. 2026-09-20 复查：上游过滤时效性、模型 ID 命名与管道归属
+
+本节为当日复查，起因是外部报告称 `providerOptions.gateway.only` 已失效（linux.do t/topic/2925265）。复测确认该报告**只对部分模型成立**，并纠正了若干容易误用的命名与管道假设。**本节结论只对当日的账号、网关与请求设置成立。**
+
+### 测试设置
+
+- 环境：硅谷服务器直连 `https://api.cline.bot/api/v1`；账号 268（当日更换 API key），请求头 `x-client-type: cline-cli`，`max_tokens: 512`，`stream: false`。
+  `max_tokens: 64` 在推理模型上会返回 `{"error":"empty response content"}`（见第 9 节），该现象与"过滤被丢弃"极易混淆，不能用来判断过滤是否生效。
+- 判据：planner 管道读响应 `choices[0].message.provider_metadata.gateway.routing` 的 `finalProvider` / `fallbacksAvailable` / `planningReasoning`；direct 管道读顶层 `provider`。
+- 方法：**不能用"指定 A 得到 A"下结论**——若网关忽略过滤并恒定返回 A，结果完全相同。本节一律做多点反证（指定 A/B/C 应分别得到 A/B/C），并补一个否定用例（指定不服务该模型的上游应当报错）。过滤被采纳时，`planningReasoning` 会出现 `Provider set restricted to: <slug>` 且 `fallbacksAvailable` 收窄；被丢弃时这两个特征都消失。
+
+### 11.1 planner 管道：整块字段被丢弃（仅部分模型）
+
+模型 `deepseek/deepseek-v4.1-flash`（`cline-pass/` 前缀形式结果相同），同一 key、同一分钟，仅改注入字段：
+
+| 注入写法 | finalProvider | fallbacksAvailable | planningReasoning |
+|---|---|---|---|
+| 不注入（基线） | `deepseek` | 15 | `System credentials planned for: deepseek, alibaba, baseten, …` |
+| `gateway.only=["togetherai"]` | `deepseek` | 15 | 同上，**无** `Provider set restricted to:` |
+| `gateway.only=["deepseek"]` | `deepseek` | 15 | 同上 |
+| 双管道 `only=["togetherai"]` | `deepseek` | 15 | 同上 |
+| `gateway.order=["togetherai"]` | `deepseek` | 15 | 同上 |
+| `gateway.sort="tps"` | `deepseek` | 15 | 同上 |
+
+即对该模型 **`only` / `order` / `sort` 全部无效**，`providerOptions.gateway` 整块未被采用。同一模型在当日 01:31 的测试中还能看到 `Provider set restricted to: deepseek. System credentials planned for: deepseek.`（fallbacks 收窄），12:30 前后已无此特征——**这类能力由 Cline 决定，随时可能开关。**
+
+### 11.2 仍然生效的对照模型
+
+| 模型 | 管道 | 反证结果 |
+|---|---|---|
+| `z-ai/glm-5.3`（`cline-pass/glm-5.3` 同结果） | planner | `only=["zai"]` → finalProvider `zai`，fallbacks 0，`Provider set restricted to: zai`；经代理注入 `friendli` → `friendli`，fallbacks 0 |
+| `z-ai/glm-5.3-flash`（`cline-pass/` 同结果） | direct | 基线 Venice；`only=["z-ai"]` → `Z.AI`；`only=["relace"]` → `Relace`；`only=["venice"]` → `Venice` |
+| `deepseek/deepseek-v4-flash` | direct | 基线 Novita；`only=["deepseek"]` → `DeepSeek`；`only=["novita"]` → `Novita`；`only=["baseten"]` → `BaseTen`；`only=["togetherai"]` → 500 `No allowed providers`（否定用例：过滤确实到达路由层，且 strict 不静默回退） |
+| `~deepseek/deepseek-v4-flash-latest` | direct | 基线 CoreWeave；`only=["deepseek"]` → `DeepSeek` |
+
+结论：**"能否指定上游"没有全局失效。**同一条 planner 管道里 `z-ai/glm-5.3` 仍然听 `providerOptions.gateway.only`，而 `deepseek/deepseek-v4.1-flash` 不听；direct 管道本次抽查的模型全部仍然生效。
+
+### 11.3 `cline-pass/` 是路由前缀，不是模型名
+
+- 当日 `GET /models` 返回 446 个模型，**不含任何 `cline-pass` 条目**，但 `cline-pass/<已存在的 slug>` 仍可用：`cline-pass/deepseek-v4.1-flash`、`cline-pass/glm-5.3`、`cline-pass/kimi-k3` 均返回 200。
+- 编造 slug（`cline-pass/nonexistent-xyz`）与不存在的名字（`cline-pass/deepseek-flash`、`deepseek/deepseek-flash`）返回 404 `model not found`。
+- `deepseek-flash` 是 **sub2api 侧的客户端模型名**，不是 Cline 模型；账号 268 的 `model_mapping` 把它映射为 `cline-pass/deepseek-v4.1-flash`。
+- **前缀会改变默认上游**：同一模型、同一 key、同一分钟：
+
+| 客户端模型 ID | finalProvider | planning 列表首位 |
+|---|---|---|
+| `cline-pass/deepseek-v4.1-flash` | `deepseek` | deepseek |
+| `deepseek/deepseek-v4.1-flash`（非前缀） | `alibaba` | alibaba |
+
+  由于过滤对这两个 ID 都无效，把映射从前缀形式改成非前缀形式会**静默换掉默认上游且无法用注入拉回**。
+- 前缀形式也可能落到私有渠道并忽略过滤：`cline-pass/deepseek-v4-flash` → `vmc/deepseek-v4-flash-contributor-fallbacks`（`openai-compatible-private`）；`cline-pass/kimi-k3` → `vmc/k3-contributor-fallbacks`。
+
+### 11.4 管道归属不能从模型名推断
+
+| 模型 ID | 管道 | 能否指定上游 |
+|---|---|---|
+| `deepseek/deepseek-v4-flash` | direct | 能 |
+| `~deepseek/deepseek-v4-flash-latest` | direct | 能 |
+| `deepseek/deepseek-v4-flash-0731` | planner | 不能（基线 baseten；注入 `novita` 后仍是 baseten，fallbacks 17 不变） |
+| `deepseek/deepseek-v4.1-flash` | planner | 不能（默认 deepseek） |
+| `cline-pass/deepseek-v4-flash` | 私有渠道 | 不能 |
+
+名称相近的 `deepseek-v4-flash` 与 `deepseek-v4-flash-0731` 分属两条管道，**必须逐 ID 实测**，不能按名字或前缀推断。
+
+### 11.5 延迟对照
+
+同机、同分钟、流式首字节，各 3 次：
+
+| 路线 | 首字节 |
+|---|---|
+| `cline-pass/deepseek-v4.1-flash`（默认 deepseek，注入无效） | 0.55 / 0.55 / 0.59 s |
+| `deepseek/deepseek-v4-flash` 钉 `deepseek`（注入有效） | 0.88 / 1.04 / 0.95 s |
+| `deepseek/deepseek-v4-flash` 钉 `novita` | 1.32 / 1.57 / 2.26 s |
+
+"能强制"的路线比"默认即最优"的路线慢约 0.3–0.5 秒。单机 3 次采样，不构成 SLA。
+
+### 11.6 同日的权益故障（与过滤无关）
+
+当日 11:45 前后，账号 268/301 的旧 key 对全部 `cline-pass/*` 返回 `403 ENTITLEMENT_ERROR: the user is not subscribed to required model plan`，而同一 key 请求非前缀 ID 仍为 200；更换账号 268 的 key 后 `cline-pass/*` 恢复。这类 403 属账号/权益问题，不能据此推断过滤行为，也不代表该命名空间被全局移除（外部报告者当日仍可用 `cline-pass/deepseek-v4.1-flash`）。
+
+### 11.7 局限
+
+- 结论仅对 2026-09-20 的该账号、该上游与上述请求设置成立；过滤是否生效由 Cline 决定，可随时变化（同一模型当日 01:31 生效、12:30 前后失效）。
+- 未验证 `x-client-type` 之外的身份条件、其他账号、其他模型族（非 deepseek / GLM）以及全部 `~…-latest` 别名。
+- 前缀与非前缀 ID 走不同路由，选哪个属于产品取舍；本文只记录事实，不给出"应当用哪个"的结论。
+- `probe` 的行为随过滤是否生效而变：过滤被丢弃时 `only=["__probe__"]` 不再触发路由错误，而是**真实执行一次推理并计费**。当日 `probe -model deepseek/deepseek-v4.1-flash` 只报"管道未识别 / 未能解析"，而 `probe -model z-ai/glm-5.3` 仍能解析出候选。
+- 延迟仅测首字节，未测吞吐（TPS）与长流式响应；外部报告提到的 TPS 下降未复现也未否定。
+- 代理侧只记录注入决策，不记录 Cline 实际采用的 `finalProvider`。本节所有"是否生效"的判断都来自手工读取响应元数据，不能从代理日志得出。

@@ -9,6 +9,15 @@ Release workflow 取该小节作为 GitHub Release 正文；若缺少对应小�
 
 ## [Unreleased]
 
+### 文档
+
+- `docs/VERIFICATION.md` 新增第 11 节（2026-09-20 复查）：上游过滤字段的时效性（`deepseek/deepseek-v4.1-flash`
+  的整个 `providerOptions.gateway` 失效）、`cline-pass/` 的前缀语义及其对默认上游的影响、逐 ID 的管道归属、
+  多点反证的判断方法，并在第 1 节标注旧结论的适用边界。
+- 两版 README 的「上游路由」「默认规则」「排查问题」补充时效性警告：过滤是否被采纳由 Cline 决定、逐模型不同
+  且可能随时变化，必须读响应元数据确认；默认 `deepseek` 规则对 `deepseek/deepseek-v4.1-flash` 当前无法强制。
+- `AGENTS.md` 补充 `cline-pass/` 前缀语义、过滤结论的复测要求，以及"指定 A 得到 A 不能作为依据"的判断标准。
+
 ## [1.0.0] - 2026-09-20
 
 首个稳定版本。
