@@ -75,6 +75,7 @@ bash scripts/linux-check.sh
 - 流式响应使用固定大小缓冲区，逐块 Flush，不解析 JSON，不等待完整响应。不设置 `http.Client.Timeout`；分别控制连接、TLS 和响应头超时。
 - 请求注入用 `json.Number` 保留数字精度，关闭 HTML 转义，保持其他字段的 JSON 语义及 `< > &`。修改注入逻辑时运行 pin 包测试。
 - 在指定管道中，preferred 删除调用方的 `only` 与 `allow_fallbacks`，strict 删除 `order`。配置了 `sort` 才覆盖原排序值，不修改无关选项。`sort` 不会取消 strict 的 `only`。
+- `mode: "exclude"` 只把排除列表写进 direct 管道的 `provider.ignore`，不写 `only`/`order`、不修改调用方已有的过滤条件；planner 没有对应字段（2026-10-17 实测），因此 `pipeline: "planner"` 必须被校验拒绝，`auto` 只作用于 direct。`exclude` 与 `upstreams` 互斥。
 - 默认 GLM 规则保留 `glm-5.3-flash → relace` 在前、`glm-5.3 → friendli` 在后。不得合并为宽泛的 `glm`。修改标识前，必须对对应模型 probe 并发送真实请求确认路由，记录到 `docs/VERIFICATION.md`。
 - 运行期配置非法或文件删除时保留上一份有效配置。启动时已有非法文件应失败；仅文件不存在时可使用默认值和环境设置启动。
 - 文件一旦包含 `rules` 就整体替换默认表。显式非法环境值应导致加载失败；文件缺失启动分支的现有例外见代码审查文末。

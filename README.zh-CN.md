@@ -194,7 +194,9 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 
 上游选择要生效，账号必须有权访问该模型，网关也必须支持它的路由字段；模型出现在 `/v1/models` 中不能单独证明这一点。**这些字段是否被采纳由 Cline 决定，逐模型不同（同一条管道上的不同模型也会不同），并且可能随时变化。**因此代理注入成功并不代表 Cline 采用了指定上游，必须读响应元数据确认：planner 管道看 `choices[0].message.provider_metadata.gateway.routing.finalProvider`，direct 管道看顶层 `provider`。过滤被采纳时，`planningReasoning` 里会出现 `Provider set restricted to: <slug>`，且 `fallbacksAvailable` 收窄。
 
-2026-09-20 实测：`deepseek/deepseek-v4.1-flash` 的整个 `providerOptions.gateway`（`only`、`order`、`sort`）全部无效；而 `z-ai/glm-5.3`（planner）、`z-ai/glm-5.3-flash` 与 `deepseek/deepseek-v4-flash`（direct）仍然生效。同一模型当天早些时候仍然生效，因此这些只是**带日期的观测值**，依赖任何规则前请重新验证。2026-09-16 已确认忽略过滤的有 `cline-pass/deepseek-v4-flash` 与 `cline-pass/deepseek-v4-pro`；2026-09-20 确认 `cline-pass/deepseek-v4-flash` 与 `cline-pass/kimi-k3` 背后的私有渠道同样忽略。依据见[实测记录](docs/VERIFICATION.md)。
+2026-09-20 实测：`deepseek/deepseek-v4.1-flash` 的整个 `providerOptions.gateway`（`only`、`order`、`sort`）全部无效；而 `z-ai/glm-5.3`（planner）、`z-ai/glm-5.3-flash` 与 `deepseek/deepseek-v4-flash`（direct）仍然生效。同一模型当天早些时候仍然生效，因此这些只是**带日期的观测值**，依赖任何规则前请重新验证。`cline-pass/deepseek-v4-pro` 仍采纳过滤；`cline-pass/deepseek-v4-flash` 已从目录下架（2026-10-17 起 404）；`cline-pass/kimi-k3` 背后的私有渠道自 2026-09-20 起忽略过滤。依据见[实测记录](docs/VERIFICATION.md)。
+
+2026-10-17 实测：`cline-pass/` 前缀改变了 GLM 5.3 的路由——`z-ai/glm-5.3` 仍在 planner 管道并采纳过滤，而 `cline-pass/glm-5.3` 被私有贡献池服务、过滤被丢弃，因此默认的 `glm-5.3 → friendli` 规则对带前缀的 ID 不生效；`cline-pass/glm-5.3-flash` 仍是 direct 管道，规则照常生效。部分旧 ID 已下架（`cline-pass/deepseek-v4-flash` 现返回 404）。`cline-pass` 命名空间下有哪些模型、走哪条管道、是否采纳过滤，都必须逐 ID 复测；带日期的矩阵见实测记录，`probe` 也会直接给出每个模型的结局。
 
 ### 默认规则
 
@@ -208,7 +210,9 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 
 `glm-5.3` 也能匹配 flash 模型名，因此 flash 规则必须放在前面；两个 GLM 模型的可用上游列表不同，合并为宽泛的 `glm` 规则可能选中不支持的上游。GLM 默认值依据 2026-09-16 的测量结果选择：`glm-5.3` 使用 `friendli` 时首个流式字节在 0.31–0.35 秒到达，`glm-5.3-flash` 使用 `relace` 时为 0.72–0.97 秒，各成功四次。这些是历史观测值，不构成延迟或质量保证，第三方服务商可能使用量化模型。
 
-第一条规则需要单独提醒：截至 2026-09-20，它对 `deepseek/deepseek-v4.1-flash` **无法强制任何东西**——该模型走 DeepSeek 是因为 Cline 自己的默认调度就选它，而不是代理钉住的。若需要"必须被强制"的上游，请改用 `deepseek/deepseek-v4-flash`（过滤仍然生效）；实测首字节约 0.9 秒，而未过滤的 `cline-pass/deepseek-v4.1-flash` 路线约 0.55 秒。上游标识、忽略过滤条件的已知模型和完整测量数据见[实测记录](docs/VERIFICATION.md)。
+第一条规则需要单独提醒：截至 2026-09-20，它对 `deepseek/deepseek-v4.1-flash` **无法强制任何东西**——该模型走 DeepSeek 是因为 Cline 自己的默认调度就选它，而不是代理钉住的。2026-10-17 复测：这个 ID 的裸形式与 `cline-pass/` 前缀形式都丢弃 `only`/`order`/`sort`（实际每次都落到 Alibaba），且 planner 没有 `ignore` 字段，**主 ID 无法钉住**。要强制官方，请改用同日快照别名 `deepseek/deepseek-v4.1-flash-1017`：它的 planner 候选仍采纳 `only`，配一条 strict `deepseek` 规则即可钉住（实测 `finalProvider=deepseek`）。该别名上 `preferred`/`order` 不生效，规则必须用 `strict`；它是裸 ID，不属于订阅命名空间，且随目录轮换可能消失。上游标识、忽略过滤条件的已知模型和完整测量数据见[实测记录](docs/VERIFICATION.md)。
+
+第三条规则有同类提醒：截至 2026-10-17，它对 `z-ai/glm-5.3` 仍能强制 `friendli`，但 `cline-pass/glm-5.3` 已被私有贡献池接管并忽略过滤，规则对带前缀的 ID 只是"看起来生效"。
 
 ### 规则字段
 
@@ -218,11 +222,22 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 | `model` | 必填，用于匹配的模型 ID 或子串。 |
 | `match` | `contains`（默认）、`prefix` 或 `exact`，均不区分大小写。 |
 | `pipeline` | `auto`（默认）同时写入两条管道；`planner` 或 `direct` 只写指定管道。 |
-| `mode` | `strict`（默认）将首个上游写入 `only`；`preferred` 将候选写入 `order`，允许回退。 |
-| `upstreams` | 必填的上游标识数组。`strict` 只使用第一项，`preferred` 至少需要两项。 |
+| `mode` | `strict`（默认）将首个上游写入 `only`；`preferred` 将候选写入 `order`，允许回退；`exclude` 把排除列表写入 direct 管道的 `provider.ignore`（仅 direct 生效）。 |
+| `upstreams` | 上游标识数组，`strict` 与 `preferred` 必填。`strict` 只使用第一项，`preferred` 至少需要两项；`exclude` 模式下必须为空。 |
+| `exclude` | 要排除的上游标识，`exclude` 模式必填，其他模式禁止填写。只有 direct 管道支持：显式写 `pipeline: "planner"` 会被校验拒绝，`auto` 也只作用于 direct。 |
 | `sort` | 可选，支持 `cost`、`ttft`、`tps`；在 direct 管道分别映射为 `price`、`latency`、`throughput`。 |
 
-在所选管道中，`strict` 会删除已有的 `order`，`preferred` 会删除已有的 `only` 和 `allow_fallbacks`，其余上游选项保留；只有配置了 `sort` 才会覆盖调用方的排序值。给严格模式添加 `sort` 不会启用回退或移除 `only`，当前规则不支持只排序而不指定候选。配置文件一旦包含 `rules`，就会整体替换默认规则表，`"rules": []` 表示关闭注入。与内置默认值一致的完整配置见 [config.example.json](config.example.json)。
+在所选管道中，`strict` 会删除已有的 `order`，`preferred` 会删除已有的 `only` 和 `allow_fallbacks`，其余上游选项保留；只有配置了 `sort` 才会覆盖调用方的排序值。给严格模式添加 `sort` 不会启用回退或移除 `only`，当前规则不支持只排序而不指定候选。`exclude` 走相反的路：它用配置的列表覆盖调用方的 `provider.ignore`，但不写也不删 `only`/`order`，调用方自己的过滤条件保持有效。配置文件一旦包含 `rules`，就会整体替换默认规则表，`"rules": []` 表示关闭注入。与内置默认值一致的完整配置见 [config.example.json](config.example.json)。
+
+排除列表只有 direct 管道认：
+
+```json
+{"provider": {"ignore": ["z-ai"]}}
+```
+
+2026-10-17 实测：`ignore` 确实到达 OpenRouter——同时用 `only` 与 `ignore` 排除 `relace` 时返回 `All providers have been ignored`；而往 `providerOptions.gateway` 写 `exclude` 会被 planner 丢弃。所以这个模式不存在 planner 等价物，而不是"写了但静默无效"。
+
+两条管道对部分渠道的拼写不同，**写错不是被忽略，而是直接导致请求失败**（2026-10-17 实测：planner 认 `zai`、`togetherai`，direct 认 `z-ai`、`together`）。使用 `pipeline: "auto"` 时按你已知的写法填 `upstreams` 即可：代理会在注入前按目标管道翻译这几组实测拼写；不在表内的上游标识原样写入。日志与 `X-Cline-Pin-Upstreams` 显示的是你配置的原值，不是翻译后的值。
 
 ## 响应格式兼容
 
@@ -251,6 +266,19 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 
 探测会注入 `only: ["__probe__"]`，再解析路由错误。支持过滤的模型会在推理前拒绝请求；忽略过滤的模型可能生成响应并产生费用。返回的列表可能不完整，列出的上游也可能在真实请求中失败。用 `-pipeline planner` 或 `-pipeline direct` 限定注入管道；探测默认携带 `x-client-type: cline-cli`，部分模型缺少该头会返回 403。命令根据列表第一项生成一条精确匹配的建议规则，使用前应确认该选择，因为替换 `rules` 会同时替换所有已有规则。
 
+每次探测都会给出「探测结局」，把"没解析出候选清单"的几种原因分开：
+
+| 结局 | 含义与下一步 |
+|---|---|
+| `routing-error` | 网关在路由层拒绝了探测上游，候选清单来自错误体。 |
+| `filter-ignored` | 过滤字段未被采纳，网关已真实执行这次推理（可能计费）。候选清单无法获得；会从响应元数据读出本次实际服务的上游（`served`）与管道，它们只是本次观测，不是候选清单。 |
+| `empty-content` | 渠道已应答但输出为空（`empty response content`），同样已计费。请求打到了模型，说明过滤字段未被采纳（被采纳会在推理前拒绝）。提高输出预算后发真实请求，再读响应元数据判断路由。 |
+| `auth` | 401/403：身份或权益被拒，本次结论无效。检查 Key、账号是否订阅该模型方案，或是否缺少身份头。 |
+| `model-unavailable` | 404 `model not found`：模型不存在或已下线。 |
+| `rate-limited` | 429：被上游限流，稍后重试。 |
+
+`POST /admin/probe` 的响应同样带 `outcome` 与 `served` 字段。
+
 `check` 只校验配置并预览匹配，不访问 Cline：
 
 ```bash
@@ -274,7 +302,8 @@ Cline 使用两条路由管道，分别从不同的请求字段读取上游设�
 |---|---|
 | `X-Cline-Pin-Rule` | 补全请求应用的规则，`none` 表示未应用规则。 |
 | `X-Cline-Pin-Upstreams` | 配置的上游列表，以 `>` 连接；严格模式仍只使用第一项。 |
-| `X-Cline-Pin-Mode` | `strict` 或 `preferred`。 |
+| `X-Cline-Pin-Exclude` | `exclude` 模式配置的排除列表，以 `>` 连接；其他模式不出现。 |
+| `X-Cline-Pin-Mode` | `strict`、`preferred` 或 `exclude`。 |
 | `X-Cline-Pin-Note` | 未注入的原因：无匹配、无法读取模型字段或注入失败。 |
 | `X-Cline-Pin-Unwrapped` | `data-envelope` 表示已转换，`skipped-too-large` 表示超出缓冲上限。 |
 

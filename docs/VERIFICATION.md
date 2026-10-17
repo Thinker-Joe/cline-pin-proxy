@@ -26,6 +26,8 @@
 planner 读取 `providerOptions.gateway.only`，direct 读取顶层 `provider.only`。默认 `auto` 同时写入两组字段。
 
 > **2026-09-20 复查**：上表中 `cline-pass/deepseek-v4.1-flash` 的"支持过滤"结论已失效——该模型对 `providerOptions.gateway` 的 `only` / `order` / `sort` 均不再响应；能继续用过滤的 deepseek 模型是 `deepseek/deepseek-v4-flash`。另外带 `cline-pass/` 前缀与不带的同一 slug 默认上游不同。详见第 11 节。
+>
+> **2026-10-17 复查（可用性）**：上表与后续章节里的 `cline-pass/deepseek-v4-flash` 已返回 404（连同 `cline-pass/deepseek-v4-flash-vision-exp`），`cline-pass/glm-5.3` 改由私有贡献池服务且忽略过滤；当日订阅清单与逐模型矩阵见第 12.6 节，`deepseek-v4.1-flash` 的钉住路径见第 12.7 节。历史记录保留原日期与语境，不代表当前可用。
 
 ### 同一服务商在不同管道中的标识
 
@@ -539,3 +541,282 @@ sub2api 再次测试账号 268 的三个模型和账号 301 的两个模型，�
 - `probe` 的行为随过滤是否生效而变：过滤被丢弃时 `only=["__probe__"]` 不再触发路由错误，而是**真实执行一次推理并计费**。当日 `probe -model deepseek/deepseek-v4.1-flash` 只报"管道未识别 / 未能解析"，而 `probe -model z-ai/glm-5.3` 仍能解析出候选。
 - 延迟仅测首字节，未测吞吐（TPS）与长流式响应；外部报告提到的 TPS 下降未复现也未否定。
 - 代理侧只记录注入决策，不记录 Cline 实际采用的 `finalProvider`。本节所有"是否生效"的判断都来自手工读取响应元数据，不能从代理日志得出。
+
+## 12. 2026-10-17 外部核对：三个上游参考项目的近期改动
+
+本节核对 [NOTICE](../NOTICE) 列出的三个上游参考项目的改动，找出值得吸收的行为与协议事实。
+**除 12.1 明确标注"本次实测"的匿名接口请求外，本节都是转述**：路由与清单结论来自对方的公开记录或
+其自己的实测，不是本项目的实测，按第 11 节多点反证复测之前不能当作 Cline 的行为。
+
+| 项目 | 核对到的 HEAD |
+|---|---|
+| `munmunjaklin458-afk/cline-pass-switcher` | `02538a3`（2026-09-11） |
+| `Stabilize7440/cpagw-gateway` | `38aba73`（2026-09-08） |
+| `yhshzh/dsh-cline-pass` | `91fbd7e`（0.2.8，2026-10-04） |
+
+### 12.1 官方推荐模型接口（本次实测，可匿名访问）
+
+`GET https://api.cline.bot/api/v1/ai/cline/recommended-models` 在 2026-10-17 无需鉴权即可读取：
+不带 `Authorization`、带错误 Bearer、使用默认 UA 均返回 200 与 `application/json`（约 3.3 KB）。
+响应顶层是 `recommended` / `free` / `clinePass` / `clineCloud` 四个数组，元素形如
+`{"id":…,"name":…,"description":…,"tags":[…]}`。`clinePass` 当日 14 条，全部带 `cline-pass/` 前缀：
+
+```text
+deepseek-v4.1-flash, mimo-v2.6-flash, mimo-v2.6-pro, glm-5.3, deepseek-v4-pro,
+qwen3.8-max, muse-spark-1.3-contributor, kimi-k3, glm-5.3-flash, qwen3.7-plus,
+qwen3.7-max, minimax-m3, mimo-v2.5-pro, mimo-v2.5
+```
+
+用途与边界：
+
+- 这是官方口径的**订阅可用清单**，不要外推：清单外再加前缀的 slug 当日返回 404（`cline-pass/claude-sonnet-5.5`、
+  `cline-pass/deepseek-v4-flash` 等，见 12.6），"能否用"以清单加逐 ID 复测为准；反过来，在清单里也不代表
+  账号可用（`muse-spark-1.3-contributor` 403）或过滤会被采纳（见第 11 节）。
+- 当日默认三条规则涉及的 `glm-5.3`、`glm-5.3-flash` 与 deepseek 系模型仍在清单内，但 `cline-pass/glm-5.3`
+  已改走私有池并忽略过滤（12.6），默认规则只对裸 ID 生效。
+- 上游项目 `cline-pass-switcher` 的 14 项内置清单（`bb7eea0`）与今日接口已不一致：`glm-5.2`、
+  `kimi-k2.6`、`kimi-k2.7-code`、`deepseek-v4-flash` 已不在接口返回中，只能当快照，不能当可用性依据。
+
+### 12.2 上游清单的第三方快照（未复测）
+
+`cpagw-gateway` 在 2026-08-26 记录了两个模型的路由表：`glm-5.2` 18 项、`kimi-k3` 14 项。与第 1 节
+2026-09-16 的记录相比，出现本文此前没有的 slug：`moonshotai`、`nebius`，以及 `together`
+（与 `togetherai` 并存）、`zai`（与 `z-ai` 并存）。这些只是**线索**：来源是对方项目的自测、日期更早，
+没有按第 11 节做多点反证，不得据此新增或修改默认规则。
+
+### 12.3 探测结局的分类（据 `dsh-cline-pass` 0.2.8 改进 `probe`）
+
+上游把"探测成功"收紧为"HTTP 成功且 `choices` 非空"，并区分几种非路由结局。本项目据此改进了 `probe`：
+代码是本仓库实现，判定依据仍取本项目的实测记录。
+
+| 结局 | 判定依据 |
+|---|---|
+| `filter-ignored`（2xx 真实执行） | 第 11.7 节：过滤被丢弃时 `only: ["__probe__"]` 不触发路由错误，而是真实推理并计费 |
+| `empty-content` | 第 9 节：`max_tokens` 过低时返回 `empty response content`，说明请求已到模型 |
+| `auth`（401/403） | 第 1 节（缺 `x-client-type` 的 403）、第 11.6 节（`ENTITLEMENT_ERROR`），两者都只能判身份/权益 |
+| `model-unavailable`（404） | 第 11.3 节：不存在的 slug 返回 404 `model not found` |
+
+同时确认三点：
+
+- `200` 或"响应里未命名渠道"都不是"采纳"证据；能读到的实际上游只能记为**本次观测**，与第 11.4 节
+  "逐 ID 实测"一致。
+- `sort: ""` 被网关拒绝（上游 `de1feaf` 记录为 400）。本项目配置会把空值与 `none` 归一为空、非法值
+  直接报错，不会发出空串 `sort`，因此无需改码。
+- 上游报告过 `200` 的 SSE 流内出现 `data: {"error": …}` 帧。本项目未复现，流式验收不能只看状态码。
+
+### 12.4 候选改动的处置
+
+| 候选 | 上游依据 | 处置 |
+|---|---|---|
+| 按管道翻译渠道拼写（planner 写 `zai`/`togetherai`，direct 写 `z-ai`/`together`） | `dsh-cline-pass` 自 2026-09-21 起归一化，称 OpenRouter 对 `provider.only` 里的未知服务商"拒绝而非忽略" | **已采纳**：12.5 的实测确认写错拼写会直接 400/404，不是被忽略；翻译表只收录实测过的两对，其余 slug 原样写入 |
+| `provider.ignore` 排除列表 | 来自 OpenRouter 文档；`cpagw-gateway` 与 `cline-pass-switcher` 都不用该字段（它们在应用层把排除项换算成 `only` 白名单） | **已采纳**：12.5 实测 direct 管道生效、planner 无对应字段；落成规则的 `mode: "exclude"`，只写 direct 的 `provider.ignore`，`pipeline: "planner"` 校验拒绝 |
+| 应用层排除项（把 `only` 算成白名单） | 同上两个项目 | 不采纳：需要维护"每模型已知上游清单"的运行时状态，白名单过期会静默失效；收益不抵复杂度 |
+
+三个项目的其余改动（账号池、额度、面板、catalog、并发上限、响应标准化）与本项目"零依赖透传代理、
+保留上游状态码、只做 data 信封还原"的边界不符，明确不吸收。响应标准化尤其冲突：它会把状态码改写为
+200/502/404 并替换错误体，破坏第 8 节验证过的状态码保留行为。
+
+### 12.5 2026-10-17 实测：拼写矩阵、排除字段与候选清单变化
+
+本节是**本项目自己的实测**，起因是核对 12.4 的候选改动。设置：直连 `https://api.cline.bot/api/v1`，
+请求头 `x-client-type: cline-cli`，`stream: false`，`max_tokens: 512`（路由对照）或 1（`probe` 子命令）；
+模型为 `z-ai/glm-5.3`（planner）与 `z-ai/glm-5.3-flash`（direct）。判据同第 11 节：读 `finalProvider` /
+`fallbacksAvailable`（planner）或顶层 `provider`（direct），并做否定用例。
+
+#### 拼写矩阵（同一渠道，两条管道写法不同）
+
+| 管道 | 注入 | HTTP | 实际路由 | 结论 |
+|---|---|---|---|---|
+| planner | `gateway.only=[zai]` | 200 | `finalProvider=zai`，fallbacks 0 | 接受 |
+| planner | `gateway.only=[z-ai]` | 500 | 400 `No available providers match the 'only' filter: z-ai` | 拒绝，不是忽略 |
+| planner | `gateway.only=[friendli]` | 200 | `finalProvider=friendli`，fallbacks 0 | 对照：过滤确实生效 |
+| planner | `gateway.only=[together]` | 500 | 400 同上，列出了 `togetherai` | 拒绝 |
+| direct | `provider.only=[z-ai]` | 200 | `provider=Z.AI` | 接受 |
+| direct | `provider.only=[zai]` | 500 | 404 `No allowed providers are available …` | 拒绝 |
+| direct | `provider.only=[relace]` | 200 | `provider=Relace` | 对照 |
+| direct | `provider.only=[togetherai]` | 500 | 404 同上 | 拒绝 |
+
+因此拼写翻译是双向的、逐管道成立的：`zai`↔`z-ai`、`togetherai`↔`together`。这只证明这两个渠道；
+其它上游标识没有实测，不得据此外推。实现只收录这两对（`internal/pin/pin.go` 的 `pipelineSpelling`），
+未知 slug 原样写入。
+
+#### 排除字段
+
+| 管道 | 注入 | HTTP | 结果 |
+|---|---|---|---|
+| direct | `provider.only=[relace]` + `provider.ignore=[relace]` | 500 | 404 `All providers have been ignored …` —— `ignore` 确实到达 OpenRouter |
+| direct | `provider.ignore=[relace]`（两次） | 200 | 两次均为 `Venice`；无过滤基线为 `Relace` / `Venice`，只能算弱证据 |
+| planner | `gateway.only=[relace]` + `gateway.exclude=[relace]` | 200 | `finalProvider=relace`：`exclude` 被丢弃，planner 无对应排除字段 |
+
+结论：`provider.ignore` 只在 direct 管道可用。planner 侧没有找到任何排除字段，不能把 `ignore` 写进
+`providerOptions.gateway` 当作等价能力。
+
+#### 候选清单与可用性变化（与第 1 节 2026-09-16 记录对比）
+
+| 模型 | 当日上游数 | 与第 1 节相比 |
+|---|---|---|
+| `z-ai/glm-5.3`（planner，`cline-pass/glm-5.3` 同） | 23 | 新增 `alibaba`、`bedrock`、`boundless`、`inference-net`、`relace`、`token-pass`；`blackbox` 不再出现 |
+| `z-ai/glm-5.3-flash`（direct，`cline-pass/` 同） | 30 | 新增 `open-inference`、`near-ai`、`decart`、`inceptron`、`inference-net`；`io-net`、`cloudflare` 不再出现 |
+| `deepseek/deepseek-v4-flash`（direct） | 24 | 仍可过滤；列表不再逐项对比 |
+
+其它当日观察：
+
+- `probe -model deepseek/deepseek-v4.1-flash` 返回 `500 empty response content`，即**过滤字段仍被丢弃**、
+  请求已真实到达模型并计费；新版 `probe` 报 `empty-content` 并说明"过滤未采纳"（12.3）。
+- `cline-pass/deepseek-v4-flash` 当日返回 `404 model not found`，与 2026-09-20 的"私有渠道、忽略过滤"
+  不同：该 ID 已不可用。`deepseek/deepseek-v4-flash` 仍可用。
+- 官方推荐模型接口当日仍可匿名读取，内容与 12.1 一致（`clinePass` 14 条）。
+- 代理端到端（默认规则）：`cline-pass/glm-5.3-flash` 非流式返回 200，顶层 `choices` 存在、
+  `provider=Relace`，响应头带 `X-Cline-Pin-Unwrapped: data-envelope`；流式请求 200、SSE 正常分帧。
+- 拼写翻译的整链验证：规则故意用"错误拼写"——planner 模型 `z-ai/glm-5.3` 配 `upstreams: ["z-ai"]`、
+  direct 模型 `z-ai/glm-5.3-flash` 配 `upstreams: ["zai"]`，`pipeline: "auto"`。两条请求均 200：
+  前者 `finalProvider=zai`，后者 `provider=Z.AI`；响应头 `X-Cline-Pin-Upstreams` 显示配置原值
+  （`z-ai` / `zai`），不是翻译后的值。
+- `exclude` 模式的整链验证（direct 模型 `z-ai/glm-5.3-flash`）：规则 `mode: "exclude"` +
+  `exclude: ["z-ai"]`，请求同时带调用方 `provider.only=["z-ai"]`。经代理返回 500
+  `All providers have been ignored`——证明规则确实写入了 `provider.ignore`、OpenRouter 采纳了它，
+  且调用方原有的 `only` 被保留。另用 `exclude: ["venice","relace"]` 连续两次，实际路由均为 `Z.AI`，
+  未出现被排除的两个渠道。
+- `exclude` 的配置校验：`pipeline: "planner"` + `mode: "exclude"` 被 `check` 拒绝
+  （`mode=exclude has no planner equivalent`），不会静默变成无效规则。
+
+局限同第 10、11 节：结论仅对当日账号与网关成立，候选清单与拼写都可能变化；只测了两个渠道和两个模型。
+
+### 12.6 2026-10-17 实测：ClinePass 订阅清单、路由与过滤支持
+
+同一账号、同一日。方法分两步，都不产生生成费用：
+
+- **存在性与路由**：发送 `messages: []`。不存在的模型返回 404 `model not found`；存在的模型
+  会被上游以 400 `At least one message is required` 拒绝，**未进入推理**，错误里带
+  `failed to invoke model '<canonical>' from <Vercel|Openrouter>`，可读出管道与规范模型 ID。
+- **过滤是否被采纳**：`probe`（注入 `only:["__probe__"]`）。返回路由错误=采纳；返回
+  `empty-content`/正文=丢弃。丢弃时该次探测已计费。
+
+#### 订阅目录（`clinePass`，14 条）
+
+| 模型 ID | 路由管道 | 规范模型 | 过滤 |
+|---|---|---|---|
+| `cline-pass/deepseek-v4.1-flash` | planner | `deepseek/deepseek-v4.1-flash` | ❌ 丢弃 |
+| `cline-pass/mimo-v2.6-flash` | direct | `xiaomi/mimo-v2.6-flash` | ✅ 8 候选 |
+| `cline-pass/mimo-v2.6-pro` | direct | `xiaomi/mimo-v2.6-pro` | ✅ 4 候选 |
+| `cline-pass/glm-5.3` | planner → 私有池 | `vmc/glm-5p3-contributor-fallbacks` | ❌ 丢弃 |
+| `cline-pass/deepseek-v4-pro` | planner | `deepseek/deepseek-v4-pro` | ✅ 6 候选 |
+| `cline-pass/qwen3.8-max` | planner → 私有池 | `vmc/qwen3p8-max-contributor-fallbacks` | ❌ 丢弃 |
+| `cline-pass/muse-spark-1.3-contributor` | — | — | 403 不在本账号计划内 |
+| `cline-pass/kimi-k3` | planner → 私有池 | `vmc/k3-contributor-fallbacks` | ❌ 丢弃 |
+| `cline-pass/glm-5.3-flash` | direct | `z-ai/glm-5.3-flash` | ✅ 30 候选 |
+| `cline-pass/qwen3.7-plus` | planner | `qwen/qwen3.7-plus` | ✅ 1 候选 |
+| `cline-pass/qwen3.7-max` | planner | `qwen/qwen3.7-max` | ✅ 1 候选 |
+| `cline-pass/minimax-m3` | planner | `minimax/minimax-m3` | ✅ 4 候选 |
+| `cline-pass/mimo-v2.5-pro` | direct | `xiaomi/mimo-v2.5-pro` | ✅ 6 候选 |
+| `cline-pass/mimo-v2.5` | direct | `xiaomi/mimo-v2.5` | ✅ 5 候选 |
+
+要点：
+
+- **带前缀会改路由，且可能改掉过滤能力**：`z-ai/glm-5.3`（planner，采纳过滤）与
+  `cline-pass/glm-5.3`（私有贡献池，丢弃过滤）已不同。默认规则 `glm-5.3 → friendli`
+  只对裸 ID 生效；对 `cline-pass/glm-5.3` 注入成功但不改变路由。`cline-pass/glm-5.3-flash`
+  仍是 direct，默认 `relace` 规则有效。
+- **订阅清单只覆盖 `cline-pass/*` 命名空间**：`cline-pass/claude-sonnet-5.5` 返回 404，
+  `cline-pass/nonexistent-xyz` 同样 404——前缀不是"任意目录模型都能加"。
+- 已下架的旧 ID（均 404）：`cline-pass/deepseek-v4-flash`、`cline-pass/deepseek-v4-pro-0813`、
+  `cline-pass/glm-5.2`、`cline-pass/kimi-k2.7-code`。12.5 里 `cline-pass/deepseek-v4-flash`
+  的"私有渠道"结论已不适用。
+- `muse-spark-1.3-contributor` 在目录里但本账号 403（`is not available in your plan`），
+  说明"目录里有"不等于"账号可用"。
+
+#### 同一 key 下的其它目录（非 cline-pass）
+
+- `recommended` 6 条均可路由：`anthropic/claude-sonnet-5.5`（direct）、`google/gemini-4-argon`
+  （planner）、`anthropic/claude-opus-5.5`（direct）、`openai/gpt-6-astra`（planner）、
+  `openai/gpt-6.1-sol`（planner）、`moonshotai/kimi-k3`（planner）。
+- `free` 4 条：`cline-free/nemotron-3.5-super-vl`（planner → `private/nvidia-nemotron-3.5-super-vl-120b-a12b`）、
+  `cline-free/mimo-v2.6-flash`（direct）、`cline-free/solar-mini4`（direct）、
+  `cline-free/muse-spark-1.3-contributor`（403，同计划限制）。
+- `cline-cloud/deepseek-v4.1-flash` 返回 403 `This request is not supported`，未确认可用。
+- `GET /models` 当日 470 个条目（2026-09-20 为 446），不含任何 `cline-pass/`、`cline-free/`、
+  `cline-cloud/` 条目；它们是独立命名空间，不能从 `/models` 推断订阅可用性。
+
+局限：只测了该账号；订阅清单与路由当天即可能变化；过滤结论只覆盖上表，未做真实补全验证
+（`probe` 的计费口径见第 11.7 节）。
+
+### 12.7 2026-10-17 实测：`deepseek-v4.1-flash` 如何钉住官方 DeepSeek
+
+背景：12.6 确认 `cline-pass/deepseek-v4.1-flash` 与裸 ID `deepseek/deepseek-v4.1-flash` 都丢弃过滤，
+默认落到 `alibaba`。本节找出可行的钉住路径。
+
+#### 主 ID 无法钉：注入与排除都无效
+
+同一账号、`max_tokens: 512`、`stream: false`，读 `finalProvider` / `fallbacksAvailable` / `planningReasoning`：
+
+| 请求 | finalProvider | fallbacks | 结论 |
+|---|---|---|---|
+| 裸 `deepseek/deepseek-v4.1-flash` ×3 | `alibaba` ×3 | 17 | 默认 alibaba |
+| `cline-pass/deepseek-v4.1-flash` ×3 | `alibaba` ×3 | 17 | 前缀只把 planning 首位改成 deepseek，实际仍是 alibaba |
+| 前缀 + `providerOptions.gateway.only=["deepseek"]` | `alibaba` | 17 | 过滤被丢弃 |
+| 前缀 + 顶层 `provider.only=["deepseek"]` | `alibaba` | 17 | planner 不读顶层字段 |
+| 前缀 + 顶层 `provider.ignore=["alibaba"]` | `alibaba` | 17 | **排除法无效**：`provider.ignore` 只属于 direct 管道 |
+| 裸 + 顶层 `provider.ignore=["alibaba"]` | `alibaba` | 17 | 同上 |
+
+即：这个模型走 planner，planner 对它的整块 `providerOptions.gateway` 被丢弃，而 planner 没有
+`ignore`/`exclude` 字段（12.5 已用 glm-5.3 验证 `gateway.exclude` 被丢弃）。**在这个 ID 上没有任何可用的钉法。**
+
+#### 实际落点分布（2026-10-17，同一账号）
+
+连续 12 次普通补全采样，前缀形式 `cline-pass/deepseek-v4.1-flash`：`finalProvider=alibaba` **12/12**，
+单次成本 $0.00001185–0.00002325。加上本节此前的各种注入尝试，当日对主 ID 的 **23 次请求全部落在
+`alibaba`**（裸形式 4 次、前缀形式 19 次）。
+
+关键在完整 `planningReasoning`：凭据规划顺序与执行顺序不同——
+
+```text
+System credentials planned for: deepseek, fireworks, baseten, alibaba, runware, particle, novita, …
+Total execution order: alibaba(system) → deepseek(system) → fireworks(system) → baseten(system) → …
+```
+
+即首个**计划**凭据是 deepseek，但网关把**实际执行顺序**重排为 alibaba 在首位。由于过滤被丢弃，
+规则无法干预这个重排。注意 `finalProvider` 表示"由哪家节点服务"，不是模型归属：
+模型仍是 DeepSeek 的 v4.1-flash，只是今天由阿里云节点执行。
+
+历史对照：2026-09-20 同一前缀形式默认落到 `deepseek`（第 11.3 节），说明该默认落点会变，
+不能当成稳定路由；需要官方节点时用本节后面的 `-1017` + strict 方案。
+
+#### 可行路径：同日快照别名 `deepseek/deepseek-v4.1-flash-1017`
+
+`/models` 里存在 `deepseek/deepseek-v4.1-flash-1017`（planner，候选仅 4 家）。它**采纳 `only`**，
+且 `order` 无效——多点反证如下（判据同第 11 节）：
+
+| 注入 | finalProvider | fallbacks | planningReasoning |
+|---|---|---|---|
+| 不注入（基线） | `deepinfra` | 3 | `System credentials planned for: deepinfra, deepseek, runinfra, inference-net` |
+| `only=["deepseek"]` | **`deepseek`** | 0 | `Provider set restricted to: deepseek` |
+| `only=["deepinfra"]` | `deepinfra` | 0 | `restricted to: deepinfra` |
+| `only=["inference-net"]` | `inference-net` | 0 | `restricted to: inference-net` |
+| `only=["runinfra"]` | `runinfra` | 0 | `restricted to: runinfra` |
+| `only=["novita"]`（否定用例） | — | — | 500 `No available providers match the 'only' filter: novita` |
+| `order=["deepseek","deepinfra"]` | `runinfra` | 3 | order 不生效，实际执行顺序被网关重排 |
+
+因此钉官方 DeepSeek 的正确写法是：
+
+```json
+{"model":"deepseek/deepseek-v4.1-flash-1017","mode":"strict","upstreams":["deepseek"]}
+```
+
+（默认的 `deepseek` 子串规则本身就会命中该 ID 并强制 `deepseek`，只要客户端改用这个模型名。）
+
+代理整链验证（规则 `deepseek-v4.1-flash-1017` → strict `deepseek`）：
+
+- `deepseek/deepseek-v4.1-flash-1017` → 200，`finalProvider=deepseek`。
+- 同一规则匹配不到 `cline-pass/deepseek-v4.1-flash`；故意给它配 strict `deepseek` 时，响应头
+  显示 `upstreams=deepseek`，但实际 `finalProvider=alibaba`——再次说明"注入成功"不等于"被采纳"。
+
+#### 边界与风险
+
+- `-1017` 是**裸 ID**（没有 `cline-pass/` 前缀），不在订阅目录里；它是否计入 ClinePass 套餐额度
+  未确认，可能与订阅计费口径不同。`cline-pass/deepseek-v4.1-flash-1017` 不存在（404）。
+- 日期快照别名可能随目录更新消失或指向新快照；引用前重新 `probe`（本例 `probe` 会返回 4 个候选，
+  若变成 `empty-content` 说明过滤又被丢弃）。
+- `preferred`（order）在该变体上不生效，规则必须用 `strict`；`sort` 未测。
+- 价格差异明显：基线 `deepinfra` 约 $0.0000021/次，官方 `deepseek` 约 $0.0000149/次（同一次短补全，
+  单次观测，不构成计价结论）。
+- 只测了一个账号与当天网关；这是"当前可用路径"，不是 Cline 的稳定接口。

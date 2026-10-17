@@ -194,7 +194,9 @@ Cline decides the pipeline for each model. With `pipeline: "auto"` the proxy wri
 
 Effective selection also needs account access to the model and gateway support for its routing fields; appearing in `/v1/models` does not establish that. Whether a model honors these fields is decided by Cline, varies per model — including between models on the same pipeline — and can change without notice. Successful injection therefore does not guarantee the requested provider was used. Confirm with the response metadata: `choices[0].message.provider_metadata.gateway.routing.finalProvider` on the planner pipeline, or top-level `provider` on the direct pipeline. When a filter is honored, `planningReasoning` contains `Provider set restricted to: <slug>` and `fallbacksAvailable` narrows.
 
-As of 2026-09-20 the whole `providerOptions.gateway` block (`only`, `order`, `sort`) had no effect on `deepseek/deepseek-v4.1-flash`, while `z-ai/glm-5.3` (planner), `z-ai/glm-5.3-flash`, and `deepseek/deepseek-v4-flash` (direct) still honored it. The same model did honor it earlier the same day, so treat these as dated observations and re-check before relying on a rule. Models already known to ignore the filters on 2026-09-16: `cline-pass/deepseek-v4-flash` and `cline-pass/deepseek-v4-pro`; the private channels behind `cline-pass/deepseek-v4-flash` and `cline-pass/kimi-k3` ignored them on 2026-09-20. See the [verification record](docs/VERIFICATION.md).
+As of 2026-09-20 the whole `providerOptions.gateway` block (`only`, `order`, `sort`) had no effect on `deepseek/deepseek-v4.1-flash`, while `z-ai/glm-5.3` (planner), `z-ai/glm-5.3-flash`, and `deepseek/deepseek-v4-flash` (direct) still honored it. The same model did honor it earlier the same day, so treat these as dated observations and re-check before relying on a rule. `cline-pass/deepseek-v4-pro` still honors the filters, while `cline-pass/deepseek-v4-flash` was removed from the catalogue (404 on 2026-10-17), and the private channel behind `cline-pass/kimi-k3` has ignored them since 2026-09-20. See the [verification record](docs/VERIFICATION.md).
+
+On 2026-10-17 the `cline-pass/` prefix changed routing for GLM 5.3: `z-ai/glm-5.3` was still on the planner pipeline and honored the filters, while `cline-pass/glm-5.3` was served by a private contributor pool and ignored them — so the default `glm-5.3` rule has no effect on the prefixed ID. `cline-pass/glm-5.3-flash` stayed on the direct pipeline and still honors its rule. Some earlier `cline-pass` IDs are gone (`cline-pass/deepseek-v4-flash` now returns 404). Which `cline-pass` IDs exist, which pipeline they use, and whether they honor filters must be re-checked per ID; the dated matrix is in the verification record, and `probe` reports the outcome per model.
 
 ### Default rules
 
@@ -208,7 +210,9 @@ Rules use case-insensitive substring matching, and the first match wins.
 
 `glm-5.3` also matches the flash model name, so the flash rule must stay first; the two GLM models have different provider lists, so a single broad `glm` rule can select an unsupported provider. The GLM defaults come from measurements on 2026-09-16: `friendli` returned the first stream bytes in 0.31–0.35 seconds for `glm-5.3`, and `relace` in 0.72–0.97 seconds for `glm-5.3-flash`, with four successful requests each. These are historical observations, not latency or quality guarantees; third-party providers may serve quantized models.
 
-The first rule needs a caveat: as of 2026-09-20 it cannot enforce anything on `deepseek/deepseek-v4.1-flash`, so DeepSeek is used there because Cline's own default already selects it — not because the proxy pinned it. If you need an enforced provider for that model, use `deepseek/deepseek-v4-flash`, whose requests are still filtered; measured first-byte time was about 0.9 s versus 0.55 s for the unfiltered `cline-pass/deepseek-v4.1-flash` route. Provider IDs, filtering exceptions, and full measurements are in the [verification notes (Chinese)](docs/VERIFICATION.md).
+The first rule needs a caveat: as of 2026-09-20 it cannot enforce anything on `deepseek/deepseek-v4.1-flash`, so DeepSeek is used there because Cline's own default already selects it — not because the proxy pinned it. Both the bare and the `cline-pass/` form of that ID ignore `only`/`order`/`sort` (2026-10-17: the actual provider was Alibaba in every run), and the planner pipeline has no `ignore` field, so there is no way to pin the main ID. To enforce the official provider, use the same-day snapshot alias `deepseek/deepseek-v4.1-flash-1017`, whose planner candidates do honor `only`: a strict `deepseek` rule pins it (`finalProvider=deepseek`, verified 2026-10-17). On that alias `preferred`/`order` is not honored, so the rule must be `strict`; the alias is a bare ID outside the subscription namespace, and it may disappear when the catalogue rotates. Provider IDs, filtering exceptions, and full measurements are in the [verification notes (Chinese)](docs/VERIFICATION.md).
+
+The third rule needs a similar caveat: as of 2026-10-17 it still enforces `friendli` on `z-ai/glm-5.3`, but `cline-pass/glm-5.3` is now served by a private contributor pool that ignores the filter, so the rule only appears to work for that ID.
 
 ### Rule fields
 
@@ -218,11 +222,22 @@ The first rule needs a caveat: as of 2026-09-20 it cannot enforce anything on `d
 | `model` | Required model ID or substring to match. |
 | `match` | `contains` (default), `prefix`, or `exact`. All are case-insensitive. |
 | `pipeline` | `auto` (default) writes both pipelines; `planner` or `direct` writes only that pipeline. |
-| `mode` | `strict` (default) writes `only` with the first provider. `preferred` writes `order` and allows fallback. |
-| `upstreams` | Required provider ID array. `strict` uses only the first item; `preferred` requires at least two. |
+| `mode` | `strict` (default) writes `only` with the first provider. `preferred` writes `order` and allows fallback. `exclude` writes `provider.ignore` (direct pipeline only). |
+| `upstreams` | Provider ID array, required for `strict` and `preferred`. `strict` uses only the first item; `preferred` requires at least two. Must be empty for `exclude`. |
+| `exclude` | Provider IDs to deny, required for `exclude` and rejected otherwise. Direct pipeline only: `pipeline: "planner"` is refused, and `auto` therefore affects only the direct pipeline. |
 | `sort` | Optional: `cost`, `ttft`, or `tps`. On the direct pipeline these map to `price`, `latency`, and `throughput`. |
 
-On the selected pipelines, `strict` removes an existing `order`, and `preferred` removes existing `only` and `allow_fallbacks`; other provider options are preserved, and `sort` replaces the caller's value only when configured. Adding `sort` to a strict rule neither enables fallback nor removes `only`, so rules cannot express sorting alone. A file's `rules` field replaces the entire default list; use `"rules": []` to disable injection. [config.example.json](config.example.json) is a complete configuration matching the defaults.
+On the selected pipelines, `strict` removes an existing `order`, and `preferred` removes existing `only` and `allow_fallbacks`; other provider options are preserved, and `sort` replaces the caller's value only when configured. Adding `sort` to a strict rule neither enables fallback nor removes `only`, so rules cannot express sorting alone. `exclude` takes the opposite approach: it replaces the caller's `provider.ignore` with the configured list and does not write or remove `only`/`order`, so a caller's own filter stays in force. A file's `rules` field replaces the entire default list; use `"rules": []` to disable injection. [config.example.json](config.example.json) is a complete configuration matching the defaults.
+
+A rule can also take the opposite approach — deny some providers and let the gateway choose among the rest. That deny list only exists on the direct pipeline:
+
+```json
+{"provider": {"ignore": ["z-ai"]}}
+```
+
+Measured on 2026-10-17: `ignore` does reach OpenRouter — a request whose `only` and `ignore` both named `relace` failed with `All providers have been ignored` — while writing `exclude` into `providerOptions.gateway` was dropped by the planner pipeline. That is why this mode has no planner equivalent rather than a silent no-op.
+
+The two pipelines spell some providers differently, and a wrong spelling fails the request instead of being ignored (measured 2026-10-17: planner accepts `zai` and `togetherai`, direct accepts `z-ai` and `together`). When writing a rule with `pipeline: "auto"`, put the provider ID as you know it: the proxy translates these measured pairs per pipeline before injection. Provider IDs outside that table are written unchanged, and the log and `X-Cline-Pin-Upstreams` show your configured values, not the translated ones.
 
 ## Response compatibility
 
@@ -251,6 +266,19 @@ With `CLINE_PIN_API_KEY` set, list the providers the gateway reports:
 
 The probe injects `only: ["__probe__"]` and parses the routing error. Models that honor the filter reject the request before inference; models that ignore it may generate a response and incur charges. The returned list can be incomplete, and a listed provider can still fail a real request. Use `-pipeline planner` or `-pipeline direct` to restrict injection; probes send `x-client-type: cline-cli` by default because some models return 403 without it. The printed suggested rule is an exact match on the first reported provider — review that choice, since replacing `rules` replaces all existing rules.
 
+Every run reports an outcome, which separates the reasons a candidate list can be missing:
+
+| Outcome | Meaning and next step |
+|---|---|
+| `routing-error` | The gateway rejected the probe upstream at the routing layer; the candidate list comes from the error body. |
+| `filter-ignored` | The filter fields were ignored and the gateway actually ran the inference (possibly billed). No candidate list can be obtained; the provider that served this request (`served`) and the pipeline are read from response metadata, and they are an observation, not a candidate list. |
+| `empty-content` | The provider answered with `empty response content`, which is also billed. Reaching the model means the filter was not honored — an honored filter rejects before inference. Raise the output budget for a real request, then read the routing metadata. |
+| `auth` | 401/403: identity or entitlement was rejected, so the run concludes nothing about routing. Check the key, the account's model plan, or a missing identity header. |
+| `model-unavailable` | 404 `model not found`: the model does not exist or is retired. |
+| `rate-limited` | 429: rate-limited upstream; retry later. |
+
+`POST /admin/probe` returns the same `outcome` and `served` fields.
+
 `check` validates configuration and previews a match without contacting Cline:
 
 ```bash
@@ -274,7 +302,8 @@ For a Cline Pass account configured as an OpenAI-compatible API-key account in s
 |---|---|
 | `X-Cline-Pin-Rule` | Rule applied to a chat completion request; `none` if no rule was applied. |
 | `X-Cline-Pin-Upstreams` | Configured provider list, joined with `>`. A strict rule still uses only the first entry. |
-| `X-Cline-Pin-Mode` | `strict` or `preferred`. |
+| `X-Cline-Pin-Exclude` | Configured deny list for `exclude` rules, joined with `>`. Absent for other modes. |
+| `X-Cline-Pin-Mode` | `strict`, `preferred`, or `exclude`. |
 | `X-Cline-Pin-Note` | Why injection was skipped: no match, unreadable model, or injection failure. |
 | `X-Cline-Pin-Unwrapped` | `data-envelope` when converted; `skipped-too-large` when over the buffer limit. |
 
