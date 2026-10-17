@@ -271,41 +271,89 @@ func runProbe(args []string) error {
 		sort.Strings(names)
 		fmt.Printf("附带请求头: %s\n", strings.Join(names, ", "))
 	}
-	if res.Pipeline == "" {
-		fmt.Printf("管道      : 未识别（网关措辞可能已变化）\n")
-	} else {
-		fmt.Printf("管道      : %s\n", res.Pipeline)
+	fmt.Printf("探测结局  : %s\n", outcomeLabel(res.Outcome))
+	if res.Pipeline != "" {
+		fmt.Printf("管道      : %s%s\n", res.Pipeline, pipelineSource(res.Outcome))
 	}
-	if len(res.Upstreams) == 0 {
-		fmt.Printf("可用上游  : 未能解析\n")
-		if res.Detail != "" {
-			fmt.Printf("原始片段  : %s\n", res.Detail)
+	if res.Served != "" {
+		fmt.Printf("实际上游  : %s（本次观测，不代表候选清单）\n", res.Served)
+	}
+	if res.Detail != "" {
+		fmt.Printf("原始片段  : %s\n", res.Detail)
+	}
+
+	switch res.Outcome {
+	case probe.OutcomeRoutingError:
+		fmt.Printf("可用上游  : %d 个\n", len(res.Upstreams))
+		for i, u := range res.Upstreams {
+			fmt.Printf("  %2d. %s\n", i+1, u)
 		}
-		fmt.Printf("\n提示：若上游返回 4xx 而非路由层报错，可能是缺少调用方身份头；\n" +
-			"      试加 -H \"x-client-type: cline-cli\" 或配置 probe_headers。\n")
-		return nil
-	}
+		fmt.Printf("\n列表可能不完整，列出的上游也可能请求失败。\n" +
+			"请发送指定上游的真实请求，并检查 finalProvider / provider 确认实际路由。\n")
 
-	fmt.Printf("可用上游  : %d 个\n", len(res.Upstreams))
-	for i, u := range res.Upstreams {
-		fmt.Printf("  %2d. %s\n", i+1, u)
-	}
-	fmt.Printf("\n列表可能不完整，列出的上游也可能请求失败。\n" +
-		"请发送指定上游的真实请求，并检查 finalProvider / provider 确认实际路由。\n")
-
-	rule := config.Rule{
-		Name:      "pin-" + sanitizeName(res.Model),
-		Model:     res.Model,
-		Match:     config.MatchExact,
-		Pipeline:  config.PipelineAuto,
-		Mode:      config.PinStrict,
-		Upstreams: []string{res.Upstreams[0]},
-	}
-	suggested, err := json.MarshalIndent([]config.Rule{rule}, "", "  ")
-	if err == nil {
-		fmt.Printf("\n建议规则（选择列表第一项，请验证后使用；替换 rules 会覆盖全部已有规则）：\n%s\n", suggested)
+		rule := config.Rule{
+			Name:      "pin-" + sanitizeName(res.Model),
+			Model:     res.Model,
+			Match:     config.MatchExact,
+			Pipeline:  config.PipelineAuto,
+			Mode:      config.PinStrict,
+			Upstreams: []string{res.Upstreams[0]},
+		}
+		suggested, err := json.MarshalIndent([]config.Rule{rule}, "", "  ")
+		if err == nil {
+			fmt.Printf("\n建议规则（选择列表第一项，请验证后使用；替换 rules 会覆盖全部已有规则）：\n%s\n", suggested)
+		}
+	case probe.OutcomeFilterIgnored:
+		fmt.Printf("\n提示：该模型未采纳过滤字段，网关已真实执行这次推理（可能已计费），\n" +
+			"      所以拿不到候选清单，对它写规则也不能改变路由。\n" +
+			"      需要能钉死的模型时，换用仍采纳过滤的 ID（见 docs/VERIFICATION.md 第 11 节）。\n")
+	case probe.OutcomeEmptyContent:
+		fmt.Printf("\n提示：渠道已经应答但输出为空（empty response content）。带 only=[__probe__] 的请求打到了模型，\n" +
+			"      说明过滤字段未被采纳（被采纳会在推理前拒绝），这次推理已计费、候选清单也拿不到。\n" +
+			"      提高输出预算后发真实请求，再读响应元数据确认实际路由。\n")
+	case probe.OutcomeAuth:
+		fmt.Printf("\n提示：身份或权益被拒（401/403），本次探测结论无效。\n" +
+			"      检查 API Key 是否有效、账号是否订阅该模型方案；\n" +
+			"      缺少调用方身份头也会 403，可试 -H \"x-client-type: cline-cli\"。\n")
+	case probe.OutcomeModelUnavailable:
+		fmt.Printf("\n提示：模型不存在或已下线；cline-pass/ 后面必须是目录里真实存在的 slug。\n")
+	case probe.OutcomeRateLimited:
+		fmt.Printf("\n提示：被上游限流（429），稍后重试；本次结论无效。\n")
+	default:
+		fmt.Printf("\n提示：无法归类的响应。请把上面的原始片段对照 docs/VERIFICATION.md 排查。\n")
 	}
 	return nil
+}
+
+// outcomeLabel 把探测结局翻成 CLI 可读的说明。
+func outcomeLabel(o probe.Outcome) string {
+	switch o {
+	case probe.OutcomeRoutingError:
+		return "routing-error（路由层拒绝，已解析候选）"
+	case probe.OutcomeFilterIgnored:
+		return "filter-ignored（过滤被丢弃，已真实推理）"
+	case probe.OutcomeEmptyContent:
+		return "empty-content（渠道已应答，输出为空）"
+	case probe.OutcomeAuth:
+		return "auth（身份或权益被拒）"
+	case probe.OutcomeModelUnavailable:
+		return "model-unavailable（模型不存在或已下线）"
+	case probe.OutcomeRateLimited:
+		return "rate-limited（被限流）"
+	default:
+		return "unknown（未能归类）"
+	}
+}
+
+// pipelineSource 说明管道是从哪里判定的，避免把元数据观测误读成错误措辞。
+func pipelineSource(o probe.Outcome) string {
+	switch o {
+	case probe.OutcomeRoutingError:
+		return "（由错误措辞判定）"
+	case probe.OutcomeFilterIgnored:
+		return "（由响应元数据判定）"
+	}
+	return ""
 }
 
 func sanitizeName(s string) string {

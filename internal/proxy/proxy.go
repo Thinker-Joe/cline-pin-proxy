@@ -202,19 +202,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, c
 	model, err := pin.ModelOf(body)
 	if err != nil {
 		s.log.Warn("model field unreadable, passing through unpinned", "error", err)
-		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "model field unreadable"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "", "model field unreadable"))
 		return
 	}
 
 	rule, matched := cfg.Match(model)
 	if !matched {
 		// 无规则命中时保留原始请求体，由上游网关路由。
-		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "no rule matched"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "", "no rule matched"))
 		return
 	}
 
 	injected, err := pin.Inject(body, pin.Options{
 		Upstreams: rule.Upstreams,
+		Exclude:   rule.Exclude,
 		Mode:      rule.Mode,
 		Pipeline:  rule.Pipeline,
 		Sort:      rule.Sort,
@@ -223,27 +224,35 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, c
 		// 注入失败时降级为未钉死透传，并在响应头里明确标注，避免"以为钉住了"。
 		s.log.Warn("injection failed, passing through unpinned",
 			"model", model, "rule", rule.Name, "error", err)
-		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "injection failed"))
+		s.forward(w, r, cfg, path, body, pinHeaders("none", "", "", "", "injection failed"))
 		return
 	}
 
 	joined := strings.Join(rule.Upstreams, ">")
-	s.log.Info("pinned request",
+	excluded := strings.Join(rule.Exclude, ">")
+	attrs := []any{
 		"model", model,
 		"rule", rule.Name,
 		"upstreams", joined,
 		"mode", string(rule.Mode),
 		"pipeline", string(rule.Pipeline),
-	)
+	}
+	if excluded != "" {
+		attrs = append(attrs, "exclude", excluded)
+	}
+	s.log.Info("pinned request", attrs...)
 
-	s.forward(w, r, cfg, path, injected, pinHeaders(rule.Name, joined, string(rule.Mode), ""))
+	s.forward(w, r, cfg, path, injected, pinHeaders(rule.Name, joined, excluded, string(rule.Mode), ""))
 }
 
 // pinHeaders 组装用于观测的响应头。note 非空表示这次没有真正钉死。
-func pinHeaders(rule, upstreams, mode, note string) map[string]string {
+func pinHeaders(rule, upstreams, exclude, mode, note string) map[string]string {
 	h := map[string]string{"X-Cline-Pin-Rule": rule}
 	if upstreams != "" {
 		h["X-Cline-Pin-Upstreams"] = upstreams
+	}
+	if exclude != "" {
+		h["X-Cline-Pin-Exclude"] = exclude
 	}
 	if mode != "" {
 		h["X-Cline-Pin-Mode"] = mode

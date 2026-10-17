@@ -247,6 +247,43 @@ func TestSetRulesAppliesImmediately(t *testing.T) {
 	}
 }
 
+// exclude 规则经持久化再重载后必须保持完整：管理 API 的写入就走这条路径。
+func TestSetRulesPersistsExcludeRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeFile(t, path, `{"rules":[]}`)
+
+	s, err := NewStore(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, persistErr, err := s.SetRules([]Rule{
+		{Name: "no-official", Model: "glm", Match: MatchExact,
+			Pipeline: PipelineDirect, Mode: PinExclude, Exclude: []string{"zai"}},
+	})
+	if err != nil {
+		t.Fatalf("SetRules: %v", err)
+	}
+	if !persisted || persistErr != nil {
+		t.Fatalf("persisted=%v persistErr=%v", persisted, persistErr)
+	}
+
+	reloaded, err := NewStore(path, nil)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	rules := reloaded.Current().Rules
+	if len(rules) != 1 {
+		t.Fatalf("rules = %+v, want 1 entry", rules)
+	}
+	if rules[0].Mode != PinExclude || len(rules[0].Exclude) != 1 || rules[0].Exclude[0] != "zai" {
+		t.Errorf("exclude rule not preserved through persistence: %+v", rules[0])
+	}
+	if len(rules[0].Upstreams) != 0 {
+		t.Errorf("exclude rule must not gain upstreams, got %v", rules[0].Upstreams)
+	}
+}
+
 func TestSetRulesRejectsInvalid(t *testing.T) {
 	s := Static(Default())
 	before := len(s.Current().Rules)

@@ -119,6 +119,46 @@ func TestPinsMatchingModelOnBothPipelines(t *testing.T) {
 	}
 }
 
+// exclude 规则把 provider.ignore 注入 direct 管道，并在观测头里如实报告。
+func TestExcludeRuleWritesIgnore(t *testing.T) {
+	upstream, got := newUpstream(t, nil)
+	srv := newServer(t, upstream.URL, config.Rule{
+		Name: "no-official", Model: "glm", Match: config.MatchContains,
+		Pipeline: config.PipelineAuto, Mode: config.PinExclude, Exclude: []string{"zai"},
+	})
+
+	rec := post(t, srv, "/v1/chat/completions", `{"model":"cline-pass/glm-5.3-flash","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	root := decodeJSON(t, got.body)
+	p, ok := root["provider"].(map[string]any)
+	if !ok {
+		t.Fatalf("provider missing: %s", got.body)
+	}
+	ignore := p["ignore"].([]any)
+	if len(ignore) != 1 || ignore[0] != "z-ai" {
+		t.Errorf("provider.ignore = %v, want [z-ai] (direct pipeline spelling)", ignore)
+	}
+	if _, has := p["only"]; has {
+		t.Errorf("exclude mode must not write only, got %v", p["only"])
+	}
+	if _, has := root["providerOptions"]; has {
+		t.Errorf("exclude mode must not create planner fields, got %v", root["providerOptions"])
+	}
+
+	if got := rec.Header().Get("X-Cline-Pin-Exclude"); got != "zai" {
+		t.Errorf("X-Cline-Pin-Exclude = %q", got)
+	}
+	if got := rec.Header().Get("X-Cline-Pin-Mode"); got != "exclude" {
+		t.Errorf("X-Cline-Pin-Mode = %q", got)
+	}
+	if got := rec.Header().Get("X-Cline-Pin-Upstreams"); got != "" {
+		t.Errorf("X-Cline-Pin-Upstreams should be absent for exclude mode, got %q", got)
+	}
+}
+
 // 未命中规则时请求体必须逐字节原样转发，由 Cline Pass 自主路由。
 func TestUnmatchedModelIsPassedThroughUntouched(t *testing.T) {
 	upstream, got := newUpstream(t, nil)

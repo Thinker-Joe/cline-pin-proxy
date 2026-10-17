@@ -41,7 +41,7 @@ func TestDefaultRulesRouteEveryModelToVerifiedSlug(t *testing.T) {
 		slug  string
 	}{
 		{"cline-pass/deepseek-v4.1-flash", "deepseek", "deepseek"},
-		{"cline-pass/deepseek-v4-flash", "deepseek", "deepseek"},
+		{"deepseek/deepseek-v4-flash", "deepseek", "deepseek"},
 		{"cline-pass/glm-5.3", "glm-5.3", "friendli"},
 		{"cline-pass/glm-5.3-flash", "glm-5.3-flash", "relace"},
 		{"z-ai/glm-5.3-flash", "glm-5.3-flash", "relace"},
@@ -139,6 +139,10 @@ func TestNormalizeRejectsInvalidRules(t *testing.T) {
 		{"no upstreams", Rule{Model: "m"}, "upstreams must not be empty"},
 		{"preferred with one upstream", Rule{Model: "m", Mode: PinPreferred, Upstreams: []string{"a"}}, "needs at least 2 upstreams"},
 		{"bad sort", Rule{Model: "m", Upstreams: []string{"a"}, Sort: "colour"}, "sort must be one of"},
+		{"exclude without list", Rule{Model: "m", Mode: PinExclude}, "requires a non-empty exclude list"},
+		{"exclude plus upstreams", Rule{Model: "m", Mode: PinExclude, Exclude: []string{"a"}, Upstreams: []string{"b"}}, "cannot be combined with upstreams"},
+		{"exclude on planner", Rule{Model: "m", Mode: PinExclude, Exclude: []string{"a"}, Pipeline: PipelinePlanner}, "no planner equivalent"},
+		{"exclude without mode", Rule{Model: "m", Upstreams: []string{"b"}, Exclude: []string{"a"}}, "only valid with mode=exclude"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,6 +188,27 @@ func TestNormalizeSortNoneBecomesEmpty(t *testing.T) {
 		}
 		if r.Sort != "" {
 			t.Errorf("Sort %q should normalize to empty, got %q", in, r.Sort)
+		}
+	}
+}
+
+// exclude 模式只接受有效列表，且不与 upstreams 混用；direct/auto 都允许。
+func TestNormalizeExcludeMode(t *testing.T) {
+	r := Rule{Model: "m", Mode: PinExclude, Exclude: []string{" z-ai ", "", "together"}}
+	if err := r.Normalize(0); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if len(r.Exclude) != 2 || r.Exclude[0] != "z-ai" || r.Exclude[1] != "together" {
+		t.Errorf("Exclude not trimmed of blanks: %v", r.Exclude)
+	}
+	if len(r.Upstreams) != 0 {
+		t.Errorf("exclude mode must not keep upstreams, got %v", r.Upstreams)
+	}
+
+	for _, p := range []Pipeline{PipelineAuto, PipelineDirect} {
+		r := Rule{Model: "m", Mode: PinExclude, Exclude: []string{"a"}, Pipeline: p, Sort: "ttft"}
+		if err := r.Normalize(0); err != nil {
+			t.Errorf("pipeline=%s should accept exclude: %v", p, err)
 		}
 	}
 }

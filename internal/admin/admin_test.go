@@ -239,6 +239,25 @@ func TestPutRulesAppliesAndReportsPersistence(t *testing.T) {
 	}
 }
 
+// 管理 API 必须接受 exclude 模式，并把排除列表原样交给 Store。
+func TestPutRulesAcceptsExcludeMode(t *testing.T) {
+	store := &fakeStore{cfg: testConfig("t"), persisted: true}
+	mux := http.NewServeMux()
+	NewHandler(store, &fakeProber{}, nil).Register(mux)
+
+	body := `[{"name":"no-official","model":"glm","mode":"exclude","pipeline":"direct","exclude":["zai"]}]`
+	rec := do(t, mux, http.MethodPut, "/admin/rules", body, bearer("t"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.setRules) != 1 || len(store.setRules[0].Exclude) != 1 || store.setRules[0].Exclude[0] != "zai" {
+		t.Errorf("exclude not forwarded: %+v", store.setRules)
+	}
+	if store.setRules[0].Mode != config.PinExclude {
+		t.Errorf("mode = %q, want exclude", store.setRules[0].Mode)
+	}
+}
+
 // 只读挂载下写回会失败：必须仍然生效，并把原因和提示如实返回。
 func TestPutRulesReportsPersistFailureButStillApplies(t *testing.T) {
 	store := &fakeStore{

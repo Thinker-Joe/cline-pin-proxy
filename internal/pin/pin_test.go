@@ -127,6 +127,119 @@ func TestInjectPipelineScoping(t *testing.T) {
 	nested(t, root, "provider")
 }
 
+// 同一渠道在两条管道的写法不同：写错不是被忽略，而是直接失败。
+// 依据：2026-10-17 实测（docs/VERIFICATION.md 第 12.5 节）。
+func TestInjectTranslatesPipelineSpecificSpelling(t *testing.T) {
+	body := []byte(`{"model":"z-ai/glm-5.3"}`)
+
+	// auto + preferred：同一份配置要在两条管道各自写成该管道认识的拼写。
+	got, err := Inject(body, Options{
+		Upstreams: []string{"z-ai", "together", "relace"},
+		Mode:      config.PinPreferred,
+		Pipeline:  config.PipelineAuto,
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	root := decode(t, got)
+	if order := strings.Join(stringsOf(t, nested(t, root, "providerOptions", "gateway")["order"]), ","); order != "zai,togetherai,relace" {
+		t.Errorf("planner order = %q, want zai,togetherai,relace", order)
+	}
+	if order := strings.Join(stringsOf(t, nested(t, root, "provider")["order"]), ","); order != "z-ai,together,relace" {
+		t.Errorf("direct order = %q, want z-ai,together,relace", order)
+	}
+
+	// strict 的单值路径同样翻译。
+	got, err = Inject(body, Options{
+		Upstreams: []string{"z-ai"}, Mode: config.PinStrict, Pipeline: config.PipelinePlanner,
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	if only := strings.Join(stringsOf(t, nested(t, decode(t, got), "providerOptions", "gateway")["only"]), ","); only != "zai" {
+		t.Errorf("planner only = %q, want zai", only)
+	}
+
+	// 不在映射表里的 slug 原样保留，不猜测未实测的别名。
+	got, err = Inject(body, Options{
+		Upstreams: []string{"friendli"}, Mode: config.PinStrict, Pipeline: config.PipelineAuto,
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	root = decode(t, got)
+	if only := strings.Join(stringsOf(t, nested(t, root, "providerOptions", "gateway")["only"]), ","); only != "friendli" {
+		t.Errorf("planner only = %q, want friendli", only)
+	}
+	if only := strings.Join(stringsOf(t, nested(t, root, "provider")["only"]), ","); only != "friendli" {
+		t.Errorf("direct only = %q, want friendli", only)
+	}
+}
+
+// exclude 模式只写 direct 管道的 provider.ignore：planner 没有对应字段，
+// 也不能因为规则命中就在 planner 侧凭空写字段。
+func TestInjectExcludeWritesOnlyDirectIgnore(t *testing.T) {
+	body := []byte(`{"model":"m","provider":{"only":["caller"],"sort":"price"},"providerOptions":{"gateway":{"only":["caller"]}}}`)
+
+	got, err := Inject(body, Options{
+		Exclude:  []string{"zai", "relace"},
+		Mode:     config.PinExclude,
+		Pipeline: config.PipelineAuto,
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	root := decode(t, got)
+
+	// planner 侧原样保留：不得新增 ignore，也不得写 sort。
+	gw := nested(t, root, "providerOptions", "gateway")
+	if only := strings.Join(stringsOf(t, gw["only"]), ","); only != "caller" {
+		t.Errorf("planner only = %q, want caller", only)
+	}
+	if _, has := gw["sort"]; has {
+		t.Errorf("exclude mode must not write planner sort, got %v", gw["sort"])
+	}
+
+	// direct：ignore 按 direct 管道拼写翻译；调用方原有的 only/sort 保留。
+	p := nested(t, root, "provider")
+	if ignore := strings.Join(stringsOf(t, p["ignore"]), ","); ignore != "z-ai,relace" {
+		t.Errorf("provider.ignore = %q, want z-ai,relace", ignore)
+	}
+	if only := strings.Join(stringsOf(t, p["only"]), ","); only != "caller" {
+		t.Errorf("caller's provider.only must be preserved, got %q", only)
+	}
+	if p["sort"] != "price" {
+		t.Errorf("caller's provider.sort must be preserved, got %v", p["sort"])
+	}
+	if _, has := p["order"]; has {
+		t.Errorf("exclude mode must not write order, got %v", p["order"])
+	}
+}
+
+// exclude 与 sort 组合时只作用于 direct 管道，排序值同样翻译。
+func TestInjectExcludeWithSort(t *testing.T) {
+	got, err := Inject([]byte(`{"model":"m"}`), Options{
+		Exclude:  []string{"togetherai"},
+		Mode:     config.PinExclude,
+		Pipeline: config.PipelineAuto,
+		Sort:     "ttft",
+	})
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	root := decode(t, got)
+	if _, has := root["providerOptions"]; has {
+		t.Errorf("exclude rule must not create planner fields, got %v", root["providerOptions"])
+	}
+	p := nested(t, root, "provider")
+	if ignore := strings.Join(stringsOf(t, p["ignore"]), ","); ignore != "together" {
+		t.Errorf("provider.ignore = %q, want together", ignore)
+	}
+	if p["sort"] != "latency" {
+		t.Errorf("provider.sort = %v, want latency", p["sort"])
+	}
+}
+
 // 注入只能增加字段，不能动调用方原有的任何内容。
 func TestInjectPreservesUnrelatedFields(t *testing.T) {
 	body := []byte(`{"model":"m","temperature":0.7,"tools":[{"type":"function"}],"messages":[{"role":"user","content":"hi"}]}`)
@@ -254,7 +367,7 @@ func TestModelOf(t *testing.T) {
 	}
 }
 
-func TestExtractUpstreams(t *testing.T) {
+func TestExtractRouting(t *testing.T) {
 	// 真实 planner 响应结构：路由元数据在 data.choices[0].message 下，不在顶层。
 	planner := map[string]any{
 		"data": map[string]any{
@@ -276,23 +389,26 @@ func TestExtractUpstreams(t *testing.T) {
 			},
 		},
 	}
-	fp, slug := ExtractUpstreams(planner)
-	if fp != "deepseek" {
-		t.Errorf("planner finalProvider = %q, want deepseek", fp)
+	got := ExtractRouting(planner)
+	if got.Pipeline != config.PipelinePlanner {
+		t.Errorf("planner pipeline = %q, want planner", got.Pipeline)
 	}
-	if slug != "deepseek/deepseek-v4.1-flash" {
-		t.Errorf("planner canonicalSlug = %q", slug)
+	if got.Provider != "deepseek" {
+		t.Errorf("planner finalProvider = %q, want deepseek", got.Provider)
+	}
+	if got.CanonicalSlug != "deepseek/deepseek-v4.1-flash" {
+		t.Errorf("planner canonicalSlug = %q", got.CanonicalSlug)
 	}
 
-	// 真实 direct 响应结构：顶层 provider 是显示名，需要 slug 化。
+	// 真实 direct 响应结构：顶层 provider 是显示名，需要 slug 化，且判定为 direct。
 	direct := map[string]any{
 		"data": map[string]any{
 			"provider": "Z.AI",
 			"model":    "z-ai/glm-5.3-flash",
 		},
 	}
-	if fp, _ := ExtractUpstreams(direct); fp != "z-ai" {
-		t.Errorf("direct provider = %q, want z-ai", fp)
+	if got := ExtractRouting(direct); got.Pipeline != config.PipelineDirect || got.Provider != "z-ai" {
+		t.Errorf("direct routing = %+v, want direct/z-ai", got)
 	}
 
 	// 去掉 data 信封也要能用。
@@ -307,13 +423,13 @@ func TestExtractUpstreams(t *testing.T) {
 			},
 		},
 	}
-	if fp, _ := ExtractUpstreams(unwrapped); fp != "novita" {
-		t.Errorf("unwrapped finalProvider = %q, want novita", fp)
+	if got := ExtractRouting(unwrapped); got.Pipeline != config.PipelinePlanner || got.Provider != "novita" {
+		t.Errorf("unwrapped routing = %+v, want planner/novita", got)
 	}
 
-	// 没有路由信息的响应必须返回空串，不能瞎猜。
-	if fp, slug := ExtractUpstreams(map[string]any{"choices": []any{}}); fp != "" || slug != "" {
-		t.Errorf("expected empty for a routing-less payload, got %q/%q", fp, slug)
+	// 没有路由信息的响应必须返回零值，不能瞎猜。
+	if got := ExtractRouting(map[string]any{"choices": []any{}}); got != (Routing{}) {
+		t.Errorf("expected zero Routing for a routing-less payload, got %+v", got)
 	}
 }
 

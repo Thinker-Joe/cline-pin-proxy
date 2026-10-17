@@ -34,6 +34,11 @@ const (
 	PinStrict PinMode = "strict"
 	// PinPreferred 用 order 按顺序尝试，当前候选失败时允许网关回退。
 	PinPreferred PinMode = "preferred"
+	// PinExclude 用 provider.ignore 排除指定渠道，其余交给网关自动路由。
+	//
+	// 只有 direct 管道（OpenRouter）支持这个字段；planner 管道没有对应的排除
+	// 字段（2026-10-17 实测：往 providerOptions.gateway 写 exclude 会被丢弃）。
+	PinExclude PinMode = "exclude"
 )
 
 // Pipeline 决定上游偏好写在哪条管道上。
@@ -52,7 +57,7 @@ const (
 	PipelineDirect  Pipeline = "direct"
 )
 
-// Rule 描述一条「模型 → 上游」钉死规则。规则按数组顺序匹配，首个命中者生效。
+// Rule 描述一条「模型 → 上游」路由规则。规则按数组顺序匹配，首个命中者生效。
 type Rule struct {
 	// Name 仅用于日志与排查。
 	Name string `json:"name"`
@@ -67,6 +72,10 @@ type Rule struct {
 	// Upstreams 是目标上游 slug，按优先级排列。
 	// strict 只用第一个；preferred 按顺序全部写入 order。
 	Upstreams []string `json:"upstreams"`
+	// Exclude 是 mode=exclude 时要排除的上游 slug，写入 direct 管道的
+	// provider.ignore。planner 管道没有对应的排除字段，因此该模式只作用于
+	// direct；pipeline 显式设为 planner 会被校验拒绝。
+	Exclude []string `json:"exclude,omitempty"`
 	// Sort 可选，取值 cost / ttft / tps，要求网关按该指标排序候选。
 	Sort string `json:"sort"`
 }
@@ -464,9 +473,9 @@ func (r *Rule) Normalize(idx int) error {
 	switch r.Mode {
 	case "":
 		r.Mode = PinStrict
-	case PinStrict, PinPreferred:
+	case PinStrict, PinPreferred, PinExclude:
 	default:
-		return fmt.Errorf("%s (%s): mode must be one of strict|preferred, got %q", where, r.Name, r.Mode)
+		return fmt.Errorf("%s (%s): mode must be one of strict|preferred|exclude, got %q", where, r.Name, r.Mode)
 	}
 
 	ups := make([]string, 0, len(r.Upstreams))
@@ -475,14 +484,41 @@ func (r *Rule) Normalize(idx int) error {
 			ups = append(ups, u)
 		}
 	}
-	if len(ups) == 0 {
-		return fmt.Errorf("%s (%s): upstreams must not be empty", where, r.Name)
+	excl := make([]string, 0, len(r.Exclude))
+	for _, u := range r.Exclude {
+		if u = strings.TrimSpace(u); u != "" {
+			excl = append(excl, u)
+		}
 	}
-	if r.Mode == PinPreferred && len(ups) < 2 {
-		// preferred 只给一个候选等价于 strict 但没有回退，通常是配置笔误。
-		return fmt.Errorf("%s (%s): mode=preferred needs at least 2 upstreams, got %d", where, r.Name, len(ups))
+
+	if r.Mode == PinExclude {
+		// exclude 是"排除法"，与 upstreams 的"指定法"互斥；混在一起会让
+		// 实际写出的字段取决于模式，配置意图就不再唯一。
+		if len(ups) != 0 {
+			return fmt.Errorf("%s (%s): mode=exclude cannot be combined with upstreams", where, r.Name)
+		}
+		if len(excl) == 0 {
+			return fmt.Errorf("%s (%s): mode=exclude requires a non-empty exclude list", where, r.Name)
+		}
+		if r.Pipeline == PipelinePlanner {
+			return fmt.Errorf("%s (%s): mode=exclude has no planner equivalent; use pipeline auto or direct", where, r.Name)
+		}
+		r.Upstreams = nil
+		r.Exclude = excl
+	} else {
+		if len(ups) == 0 {
+			return fmt.Errorf("%s (%s): upstreams must not be empty", where, r.Name)
+		}
+		if len(excl) != 0 {
+			return fmt.Errorf("%s (%s): exclude is only valid with mode=exclude", where, r.Name)
+		}
+		if r.Mode == PinPreferred && len(ups) < 2 {
+			// preferred 只给一个候选等价于 strict 但没有回退，通常是配置笔误。
+			return fmt.Errorf("%s (%s): mode=preferred needs at least 2 upstreams, got %d", where, r.Name, len(ups))
+		}
+		r.Upstreams = ups
+		r.Exclude = nil
 	}
-	r.Upstreams = ups
 
 	switch s := strings.ToLower(strings.TrimSpace(r.Sort)); s {
 	case "", "none":

@@ -43,8 +43,38 @@ type Result struct {
 	Pipeline  string   `json:"pipeline"`
 	Upstreams []string `json:"upstreams"`
 	Status    int      `json:"status"`
-	Detail    string   `json:"detail,omitempty"`
+	// Outcome 是结局分类，见 Outcome 常量。
+	Outcome Outcome `json:"outcome"`
+	// Served 是成功响应里读到的实际上游 slug。它只表示"本次观测到了谁在
+	// 服务"，既不代表候选清单，也不证明过滤被采纳。
+	Served string `json:"served,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
+
+// Outcome 是探测的结局分类。
+//
+// 它存在的理由：没解析出候选清单并不只有"网关措辞变了"一种可能。把
+// "过滤被丢弃、已经真实推理计费"误报成"再补个身份头试试"，会让使用者以为
+// 探测免费且失败——实际已经产生费用，而且该模型根本钉不住。
+type Outcome string
+
+const (
+	// OutcomeRoutingError 网关在路由层拒绝了 __probe__，候选清单从错误体解析。
+	OutcomeRoutingError Outcome = "routing-error"
+	// OutcomeFilterIgnored 请求被真实执行：过滤字段未被采纳，可能已产生推理费用。
+	OutcomeFilterIgnored Outcome = "filter-ignored"
+	// OutcomeEmptyContent 渠道已应答但输出为空（empty response content）。
+	// 请求打到了模型，说明过滤字段未被采纳（被采纳会在推理前拒绝），且同样已计费。
+	OutcomeEmptyContent Outcome = "empty-content"
+	// OutcomeAuth 401/403：身份或权益被拒，探测得不出路由结论。
+	OutcomeAuth Outcome = "auth"
+	// OutcomeModelUnavailable 404 model not found：模型不存在或已下线。
+	OutcomeModelUnavailable Outcome = "model-unavailable"
+	// OutcomeRateLimited 429：被限流，本次结论无效。
+	OutcomeRateLimited Outcome = "rate-limited"
+	// OutcomeUnknown 其他无法归类的响应，看 Detail 里的原始片段。
+	OutcomeUnknown Outcome = "unknown"
+)
 
 // Probe 探测一个模型背后真实可用的上游渠道。
 //
@@ -111,12 +141,51 @@ func Probe(ctx context.Context, client *http.Client, cfg *config.Config, model, 
 	res.Status = resp.StatusCode
 
 	detected, upstreams := Extract(string(text))
-	res.Pipeline = detected
 	res.Upstreams = upstreams
-	if len(upstreams) == 0 {
-		res.Detail = truncate(string(text), 400)
+	if len(upstreams) > 0 {
+		res.Pipeline = detected
+		res.Outcome = OutcomeRoutingError
+		return res, nil
 	}
+
+	// 没有候选清单时不能一律当成"解析失败"：2xx 说明过滤被丢弃、请求已经
+	// 真实执行；401/403 说明连身份或权益都没通过。这两种结局的诊断建议完全
+	// 不同，混在一起会把"已经花了钱、且钉不住"说成"再补个头试试"。
+	res.Outcome, res.Pipeline, res.Served = classifyFailure(string(text), resp.StatusCode)
+	res.Detail = truncate(string(text), 400)
 	return res, nil
+}
+
+// classifyFailure 给"没解析出候选清单"的探测结果归类。
+//
+// 返回的 pipeline/served 只来自成功响应里的路由元数据，属于"本次观测"，
+// 不能当成候选清单，也不能证明过滤被采纳。
+func classifyFailure(bodyText string, status int) (Outcome, string, string) {
+	lower := strings.ToLower(bodyText)
+
+	// 输出预算不足时渠道已经应答并计费，与路由无关。判定要在状态码之前：
+	// 该现象实测返回 500，先按 5xx 归类会丢掉"已到模型"这个关键信息。
+	if strings.Contains(lower, "empty response content") {
+		return OutcomeEmptyContent, "", ""
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return OutcomeAuth, "", ""
+	}
+	if status == http.StatusTooManyRequests {
+		return OutcomeRateLimited, "", ""
+	}
+	if status == http.StatusNotFound && strings.Contains(lower, "model not found") {
+		return OutcomeModelUnavailable, "", ""
+	}
+	if status >= 200 && status < 300 {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(bodyText), &payload); err == nil {
+			routing := pin.ExtractRouting(payload)
+			return OutcomeFilterIgnored, string(routing.Pipeline), routing.Provider
+		}
+		return OutcomeFilterIgnored, "", ""
+	}
+	return OutcomeUnknown, "", ""
 }
 
 // Extract 从网关的错误响应里还原出管道类型与真实可用的上游清单。

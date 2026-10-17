@@ -29,6 +29,38 @@ var openRouterSort = map[string]string{
 	"tps":  "throughput",
 }
 
+// pipelineSpelling 记录同一渠道在两条管道里的不同写法，注入前按目标管道翻译。
+//
+// 依据：2026-10-17 对 api.cline.bot 的实测（docs/VERIFICATION.md 第 12.5 节）。
+// 把 slug 写到错误的管道不是"被忽略"，而是直接失败：
+//
+//	planner 对 z-ai / together 返回 400 No available providers match the 'only' filter
+//	direct  对 zai / togetherai 返回 404 No allowed providers
+//
+// 与 sort 的 cost→price 同性质：这是网关侧的命名差异，由代理在写入时翻译，
+// 而不是让每条规则自己区分管道。不在表里的 slug 原样保留——不猜测未实测的别名。
+var pipelineSpelling = map[config.Pipeline]map[string]string{
+	config.PipelinePlanner: {"z-ai": "zai", "together": "togetherai"},
+	config.PipelineDirect:  {"zai": "z-ai", "togetherai": "together"},
+}
+
+// canonicalUpstreams 返回该管道应写入的 slug 列表；不修改入参，无映射时原样返回。
+func canonicalUpstreams(ups []string, pipeline config.Pipeline) []string {
+	table := pipelineSpelling[pipeline]
+	if len(table) == 0 || len(ups) == 0 {
+		return ups
+	}
+	out := make([]string, len(ups))
+	for i, u := range ups {
+		if canonical, ok := table[u]; ok {
+			out[i] = canonical
+			continue
+		}
+		out[i] = u
+	}
+	return out
+}
+
 // ErrNotObject 表示请求体不是一个 JSON 对象，无法注入。
 var ErrNotObject = fmt.Errorf("request body is not a JSON object")
 
@@ -36,7 +68,10 @@ var ErrNotObject = fmt.Errorf("request body is not a JSON object")
 type Options struct {
 	// Upstreams 是目标上游 slug，按优先级排列。
 	Upstreams []string
-	// Mode 决定用 only（strict）还是 order（preferred）。
+	// Exclude 是 mode=exclude 时要排除的上游 slug，只写 direct 管道的
+	// provider.ignore：planner 管道没有对应的排除字段（2026-10-17 实测）。
+	Exclude []string
+	// Mode 决定用 only（strict）、order（preferred）还是 ignore（exclude）。
 	Mode config.PinMode
 	// Pipeline 决定写在哪条管道上。
 	Pipeline config.Pipeline
@@ -72,6 +107,7 @@ func Inject(body []byte, opts Options) ([]byte, error) {
 	}
 
 	ups := normalizeUpstreams(opts.Upstreams)
+	excl := normalizeUpstreams(opts.Exclude)
 	sort := strings.ToLower(strings.TrimSpace(opts.Sort))
 	preferred := opts.Mode == config.PinPreferred
 
@@ -79,17 +115,28 @@ func Inject(body []byte, opts Options) ([]byte, error) {
 
 	// 直接在被注入的那层对象上改，而不是先造一个临时 map 再合并：
 	// 代理必须能**删掉**自己管辖字段里的旧值（见 applyChoice）。
-	if writePlanner {
+	//
+	// exclude 模式没有 upstreams，planner 也没有 ignore 对应物，所以两条分支
+	// 都按"实际要写的内容"判断，而不是只看管道开关：否则 exclude 规则会在
+	// planner 侧凭空写出一个 sort。
+	if writePlanner && len(ups) > 0 {
 		gw := nestedMap(root, "providerOptions", "gateway")
-		applyChoice(gw, ups, preferred)
+		applyChoice(gw, canonicalUpstreams(ups, config.PipelinePlanner), preferred)
 		if sort != "" {
 			gw["sort"] = sort
 		}
 	}
 
-	if writeDirect {
+	if writeDirect && (len(ups) > 0 || len(excl) > 0) {
 		p := nestedMap(root, "provider")
-		applyChoice(p, ups, preferred)
+		if len(ups) > 0 {
+			applyChoice(p, canonicalUpstreams(ups, config.PipelineDirect), preferred)
+		}
+		if len(excl) > 0 {
+			// ignore 是排除法：调用方原有的 only/order 保留不动，与"不修改
+			// 无关选项"的约定一致。
+			p["ignore"] = toAnySlice(canonicalUpstreams(excl, config.PipelineDirect))
+		}
 		if sort != "" {
 			if mapped, ok := openRouterSort[sort]; ok {
 				sort = mapped
@@ -186,37 +233,51 @@ func toAnySlice(in []string) []any {
 	return out
 }
 
-// ExtractUpstreams 读回响应里的路由事实，供日志与验收使用。
+// Routing 是一次补全响应里能读到的路由事实。
 //
-// 真实响应（2026-09 api.cline.bot 实测）里这两个字段的位置是：
+// 真实响应（2026-09 api.cline.bot 实测）里这些字段的位置是：
 //
-//	planner：data.choices[0].message.provider_metadata.gateway.routing.finalProvider
+//	planner：data.choices[0].message.provider_metadata.gateway.routing.{finalProvider,canonicalSlug}
 //	direct ：data.provider（显示名，需要 slug 化，例如 "Z.AI" -> "z-ai"）
 //
 // 注意路由元数据挂在 choices[0].message 下，不在响应顶层；同时也兼容去掉
 // data 信封、以及 provider_metadata 直接挂在 choice 上的变体。
 //
-// 返回空串表示该响应没有携带路由信息（例如错误响应）。
-func ExtractUpstreams(payload map[string]any) (finalProvider, canonicalSlug string) {
+// 管道由**字段出现的位置**判定，不能按模型名推断。零值表示响应没有携带
+// 路由信息（例如路由层错误），不能当成"没有服务过"。
+type Routing struct {
+	// Pipeline 是元数据所在管道；读不到路由信息时为空。
+	Pipeline config.Pipeline
+	// Provider 是实际服务的上游 slug：planner 读 finalProvider（本就是 slug），
+	// direct 读顶层 provider 显示名再 slug 化。
+	Provider string
+	// CanonicalSlug 是 planner 元数据里的模型规范名；direct 不提供。
+	CanonicalSlug string
+}
+
+// ExtractRouting 读回响应里的路由事实，供日志、探测与验收使用。
+func ExtractRouting(payload map[string]any) Routing {
 	root := payload
 	if data, ok := payload["data"].(map[string]any); ok {
 		root = data
 	}
 
 	if routing, ok := routingFrom(root); ok {
+		out := Routing{Pipeline: config.PipelinePlanner}
 		if s, ok := routing["finalProvider"].(string); ok {
-			finalProvider = s
+			out.Provider = s
 		}
 		if s, ok := routing["canonicalSlug"].(string); ok {
-			canonicalSlug = s
+			out.CanonicalSlug = s
+		}
+		if out.Provider != "" || out.CanonicalSlug != "" {
+			return out
 		}
 	}
-	if finalProvider == "" {
-		if s, ok := root["provider"].(string); ok {
-			finalProvider = slugify(s)
-		}
+	if s, ok := root["provider"].(string); ok && strings.TrimSpace(s) != "" {
+		return Routing{Pipeline: config.PipelineDirect, Provider: slugify(s)}
 	}
-	return finalProvider, canonicalSlug
+	return Routing{}
 }
 
 // routingFrom 依次尝试几处已知的放置位置，返回 provider_metadata.gateway.routing。

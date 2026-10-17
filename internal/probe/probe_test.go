@@ -215,6 +215,9 @@ func TestProbeAgainstRealPlannerResponse(t *testing.T) {
 	if res.Pipeline != "planner" || len(res.Upstreams) != 16 {
 		t.Errorf("pipeline=%q upstreams=%d, want planner/16", res.Pipeline, len(res.Upstreams))
 	}
+	if res.Outcome != OutcomeRoutingError {
+		t.Errorf("outcome = %q, want %q", res.Outcome, OutcomeRoutingError)
+	}
 	if res.Detail != "" {
 		t.Errorf("Detail should be empty on success, got %q", res.Detail)
 	}
@@ -259,8 +262,119 @@ func TestProbeUnparsableKeepsDetail(t *testing.T) {
 	if len(res.Upstreams) != 0 {
 		t.Errorf("upstreams = %v, want empty", res.Upstreams)
 	}
+	if res.Outcome != OutcomeUnknown {
+		t.Errorf("outcome = %q, want %q", res.Outcome, OutcomeUnknown)
+	}
 	if res.Detail == "" {
 		t.Error("detail should carry the raw error snippet for diagnosis")
+	}
+}
+
+// 过滤被丢弃时网关会真实执行请求并返回正常补全。这种结局必须与"路由层拒绝"
+// 分开：候选清单拿不到，但请求已经计费，而且该模型根本钉不住。
+func TestProbeFilterIgnoredReportsServedProvider(t *testing.T) {
+	cases := []struct {
+		name     string
+		reply    string
+		pipeline string
+		served   string
+	}{
+		{
+			name: "direct",
+			reply: `{"data":{"id":"gen_01","object":"chat.completion","model":"z-ai/glm-5.3-flash",` +
+				`"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],` +
+				`"provider":"Z.AI"},"success":true}`,
+			pipeline: "direct",
+			served:   "z-ai",
+		},
+		{
+			name: "planner",
+			reply: `{"data":{"choices":[{"index":0,"message":{"role":"assistant","content":"OK",` +
+				`"provider_metadata":{"gateway":{"routing":{"finalProvider":"deepseek","fallbacksAvailable":[]}}}}}]},` +
+				`"success":true}`,
+			pipeline: "planner",
+			served:   "deepseek",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := probeUpstream(t, "deepseek/deepseek-v4.1-flash", "", "", func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.reply))
+			})
+			cfg := &config.Config{Upstream: upstream.URL}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := Probe(context.Background(), upstream.Client(), cfg, "deepseek/deepseek-v4.1-flash", "")
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			if res.Outcome != OutcomeFilterIgnored {
+				t.Errorf("outcome = %q, want %q", res.Outcome, OutcomeFilterIgnored)
+			}
+			// 管道由元数据位置判定，不能从模型名推断。
+			if res.Pipeline != tc.pipeline {
+				t.Errorf("pipeline = %q, want %q", res.Pipeline, tc.pipeline)
+			}
+			if res.Served != tc.served {
+				t.Errorf("served = %q, want %q", res.Served, tc.served)
+			}
+			// 实际上游不是候选清单：不能把它混进 Upstreams。
+			if len(res.Upstreams) != 0 {
+				t.Errorf("upstreams = %v, want empty (served provider is not a candidate list)", res.Upstreams)
+			}
+			if res.Detail == "" {
+				t.Error("detail should keep the raw body snippet")
+			}
+		})
+	}
+}
+
+// 非路由结局的几种响应：各归类正确，且都不把状态码当成"可用性"结论。
+func TestProbeClassifiesNonRoutingOutcomes(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		reply   string
+		outcome Outcome
+	}{
+		{"empty content", http.StatusInternalServerError, `{"error":"empty response content"}`, OutcomeEmptyContent},
+		{"unauthorized", http.StatusUnauthorized, `{"error":"invalid api key"}`, OutcomeAuth},
+		{"product surfaces", http.StatusForbidden,
+			`{"error":"deepseek/deepseek-v4-flash is only available via Cline product surfaces."}`, OutcomeAuth},
+		{"model not found", http.StatusNotFound, `{"error":"model not found"}`, OutcomeModelUnavailable},
+		{"rate limited", http.StatusTooManyRequests, `{"error":"rate limited"}`, OutcomeRateLimited},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := probeUpstream(t, "m", "", "", func(w http.ResponseWriter) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.reply))
+			})
+			cfg := &config.Config{Upstream: upstream.URL}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := Probe(context.Background(), upstream.Client(), cfg, "m", "")
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			if res.Outcome != tc.outcome {
+				t.Errorf("outcome = %q, want %q", res.Outcome, tc.outcome)
+			}
+			if res.Pipeline != "" || res.Served != "" {
+				t.Errorf("pipeline/served = %q/%q, want empty", res.Pipeline, res.Served)
+			}
+			if len(res.Upstreams) != 0 {
+				t.Errorf("upstreams = %v, want empty", res.Upstreams)
+			}
+			if res.Detail == "" {
+				t.Error("detail should carry the raw body snippet")
+			}
+		})
 	}
 }
 
